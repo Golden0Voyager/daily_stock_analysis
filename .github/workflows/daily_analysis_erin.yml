@@ -1,0 +1,93 @@
+name: Erin 自选股分析
+
+on:
+  schedule:
+    - cron: '0 11 * * 1-5'     # 周一到周五，UTC 11:00 = 北京时间 19:00
+
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '运行模式'
+        required: true
+        default: 'stocks-only'
+        type: choice
+        options:
+          - full
+          - market-only
+          - stocks-only
+      force_run:
+        description: '强制运行'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: stock-analysis-erin
+  cancel-in-progress: false
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(vars.ANALYSIS_TIMEOUT_MINUTES || '30') }}
+
+    steps:
+      - name: 随机延迟
+        run: sleep $((RANDOM % 60))
+
+      - name: 检出代码
+        uses: actions/checkout@v5
+
+      - name: 设置 Python 环境
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 安装依赖
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 创建必要目录
+        run: |
+          mkdir -p data logs reports
+
+      - name: 执行股票分析
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL || secrets.OPENAI_BASE_URL }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || secrets.OPENAI_MODEL }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          STOCK_LIST: "300059,601899,601088,600901,002475,002223,002230"
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          LOG_LEVEL: INFO
+          MAX_WORKERS: 1
+          REPORT_TYPE: simple
+
+        run: |
+          MODE="${{ github.event.inputs.mode || 'stocks-only' }}"
+          echo "🚀 Erin 自选股分析 - $MODE"
+          echo "📊 自选股: $STOCK_LIST"
+
+          FORCE_RUN_ARG=""
+          if [ "${{ github.event.inputs.force_run }}" = "true" ]; then
+            FORCE_RUN_ARG="--force-run"
+          fi
+
+          if [ "$MODE" = "market-only" ]; then
+            python main.py --market-review $FORCE_RUN_ARG
+          elif [ "$MODE" = "stocks-only" ]; then
+            python main.py --no-market-review $FORCE_RUN_ARG
+          else
+            python main.py $FORCE_RUN_ARG
+          fi
+
+      - name: 上传分析报告
+        uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: analysis-reports-erin-${{ github.run_number }}
+          path: |
+            reports/
+            logs/
+          retention-days: 30
