@@ -2,7 +2,7 @@ name: Dad 自选股分析
 
 on:
   schedule:
-    - cron: '15 10 * * 1-5'     # 周一到周五，UTC 10:15 = 北京时间 18:15
+    - cron: '15 9 * * 1-5'     # 周一到周五，UTC 9:15 = 北京时间 17:15
 
   workflow_dispatch:
     inputs:

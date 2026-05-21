@@ -2,7 +2,7 @@ name: My 自选股分析
 
 on:
   schedule:
-    - cron: '30 9 * * 1-5'     # 周一到周五，UTC 9:30 = 北京时间 17:30
+    - cron: '30 8 * * 1-5'     # 周一到周五，UTC 8:30 = 北京时间 16:30
 
   workflow_dispatch:
     inputs:
