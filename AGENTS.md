@@ -1,3 +1,10 @@
+## ⚠️ 环境约束（强制）
+
+- **包管理器**：`uv pip install <pkg>`（禁止 `pip` / `python -m pip`）
+- **运行脚本**：`uv run python <script>.py`（禁止直接 `python`）
+
+---
+
 # AGENTS.md
 
 本文件用于约束本仓库的默认开发流程，目标是减少重复沟通、减少返工，并让改动和当前项目结构保持一致。
