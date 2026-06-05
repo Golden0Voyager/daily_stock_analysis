@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [文档] 补充 Issue #1316 参数自愈改动的外部兼容依据、运行时配置清理边界与回滚证据；并在 `tests/test_system_config_service.py` 增加清理路径下 `LLM_TEMPERATURE` 保持不变的回归用例。
 - [文档] 补充严格 temperature 兼容语义的官方来源、运行时依赖约束与 `LLM_TEMPERATURE` 回退/不回写路径说明。
 
+- [改进] Token Plan 请求优化 Phase 1：GitHub Actions workflow 默认启用 `REPORT_INTEGRITY_RETRY=0` 和 `GEMINI_REQUEST_DELAY=0`，减少每只股额外 1 次重试请求和固定间隔等待。
+- [新功能] Token Plan 请求优化 Phase 2：实现真·批量 LLM 分析（`GeminiAnalyzer.analyze_batch()`），支持将多只股票合并为单次 LLM 请求；Pipeline 新增 `_run_batch_llm` 路径，自动检测 `llm_batch_mode` 配置并路由。
+- [新功能] Token Plan 请求优化 Phase 3：数据指纹缓存（`AnalysisCache`），当股票关键数据未变化时直接复用上轮结果，无需再次请求 LLM。
+- [文档] 补充 Token Plan 请求优化方案（docs/token-plan-optimization-plan.md），涵盖 Phase 1/2/3 完整规划。
 - [修复] 统一 Windows 桌面安装包与自动更新元数据文件名，避免 Release 中出现重复安装包并阻断 `latest.yml` 指向不存在附件。
 - [修复] 桌面端启动 WebUI 时为入口页增加 no-cache 响应头和版本化 cache-busting URL，避免安装新版后 Electron 继续复用旧 WebUI 缓存。
 
