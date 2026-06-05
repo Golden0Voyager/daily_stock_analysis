@@ -139,6 +139,19 @@ export const LLM_PROVIDER_TEMPLATES: LLMProviderTemplate[] = [
     ],
   },
   {
+    channelId: 'sensenova',
+    label: '商汤 SenseNova（Token Plan）',
+    protocol: 'openai',
+    baseUrl: 'https://token.sensenova.cn/v1',
+    placeholderModels: 'sensenova-6.7-flash-lite,deepseek-v4-flash',
+    capabilities: ['openai-compatible'],
+    configHint: 'Token Plan 为免费公测计划，配额每 5 小时重置；API Key 格式为 sk-xxx，请从控制台复制完整 Key。',
+    officialSources: [
+      { label: 'SenseNova Token Plan', url: 'https://platform.sensenova.cn/token-plan' },
+      { label: 'SenseNova 开放平台', url: 'https://platform.sensenova.cn/docs' },
+    ],
+  },
+  {
     channelId: 'siliconflow',
     label: '硅基流动（SiliconFlow）',
     protocol: 'openai',
