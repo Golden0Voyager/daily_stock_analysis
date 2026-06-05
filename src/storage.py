@@ -273,6 +273,25 @@ class AnalysisHistory(Base):
         }
 
 
+class AnalysisCache(Base):
+    """分析结果缓存模型（Phase 3：数据未变时跳过 LLM 调用）。
+
+    以股票代码 + 数据指纹为键，缓存完整的 AnalysisResult JSON，
+    当后续分析时指纹匹配则直接复用，无需再次请求 LLM。
+    """
+    __tablename__ = 'analysis_cache'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    code = Column(String(10), nullable=False, index=True)
+    fingerprint = Column(String(64), nullable=False, index=True)
+    result_json = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.now)
+
+    __table_args__ = (
+        Index('ix_analysis_cache_code_fp', 'code', 'fingerprint', unique=True),
+    )
+
+
 class BacktestResult(Base):
     """单条分析记录的回测结果。"""
 
@@ -1458,7 +1477,49 @@ class DatabaseManager:
                 .limit(1)
             ).scalars().first()
             return result
-    
+
+    def get_cached_analysis(self, code: str, fingerprint: str) -> Optional[str]:
+        """根据股票代码和数据指纹查询缓存的分析结果 JSON。
+
+        Returns:
+            缓存的 JSON 字符串，未命中返回 None。
+        """
+        with self.get_session() as session:
+            cache = session.execute(
+                select(AnalysisCache)
+                .where(AnalysisCache.code == code)
+                .where(AnalysisCache.fingerprint == fingerprint)
+            ).scalars().first()
+            return cache.result_json if cache else None
+
+    def save_cached_analysis(
+        self,
+        code: str,
+        fingerprint: str,
+        result_json: str,
+    ) -> None:
+        """保存/更新分析结果到缓存。
+
+        每只股票保留一条记录，数据变化时覆盖更新。
+        """
+        with self.get_session() as session:
+            cache = session.execute(
+                select(AnalysisCache).where(AnalysisCache.code == code)
+            ).scalars().first()
+
+            if cache:
+                cache.fingerprint = fingerprint
+                cache.result_json = result_json
+                cache.created_at = datetime.now()
+            else:
+                cache = AnalysisCache(
+                    code=code,
+                    fingerprint=fingerprint,
+                    result_json=result_json,
+                )
+                session.add(cache)
+            session.commit()
+
     def get_data_range(
         self, 
         code: str, 
