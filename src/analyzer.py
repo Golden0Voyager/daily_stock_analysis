@@ -1813,6 +1813,14 @@ class GeminiAnalyzer:
         self._router = None
         self._legacy_router_model_list: List[Dict[str, Any]] = []
         self._litellm_available = False
+        # --- 运行时 LLM 调用统计 ---
+        self._session_stats: Dict[str, Any] = {
+            "call_count": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "fallback_count": 0,
+        }
         self._init_litellm()
         if not self._litellm_available:
             logger.warning("No LLM configured (LITELLM_MODEL / API keys), AI analysis will be unavailable")
@@ -2400,6 +2408,34 @@ class GeminiAnalyzer:
             last_usage=last_usage,
         )
 
+    def _accumulate_session_stats(
+        self,
+        usage: Dict[str, Any],
+        *,
+        fallback: bool = False,
+    ) -> None:
+        """累加单次 LLM 调用统计到会话级计数器。"""
+        self._session_stats["call_count"] += 1
+        self._session_stats["prompt_tokens"] += usage.get("prompt_tokens", 0) or 0
+        self._session_stats["completion_tokens"] += usage.get("completion_tokens", 0) or 0
+        self._session_stats["total_tokens"] += usage.get("total_tokens", 0) or 0
+        if fallback:
+            self._session_stats["fallback_count"] += 1
+
+    def get_session_stats(self) -> Dict[str, Any]:
+        """返回当前会话的 LLM 调用统计快照。"""
+        return dict(self._session_stats)
+
+    def reset_session_stats(self) -> None:
+        """重置会话级 LLM 调用统计。"""
+        self._session_stats = {
+            "call_count": 0,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "fallback_count": 0,
+        }
+
     def generate_text(
         self,
         prompt: str,
@@ -2555,8 +2591,11 @@ class GeminiAnalyzer:
                         response_text = exc.last_response_text
                         model_used = exc.last_model
                         llm_usage = exc.last_usage
+                        self._accumulate_session_stats(llm_usage, fallback=True)
                     else:
                         raise
+                else:
+                    self._accumulate_session_stats(llm_usage)
                 elapsed = time.time() - start_time
 
                 # 记录响应信息
@@ -3694,6 +3733,7 @@ Return **only** a JSON array. Do not wrap it in markdown code blocks. Example:
                     stream=False,
                     response_validator=self._validate_json_array_response,
                 )
+                self._accumulate_session_stats(llm_usage)
 
                 logger.info(
                     "[Batch] 批次 %d 响应成功: model=%s, usage=%s",
