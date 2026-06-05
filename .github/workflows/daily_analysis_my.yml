@@ -57,8 +57,8 @@ jobs:
           # SenseNova Token Plan（OpenAI Compatible）
           # GitHub Secrets/Variables 使用清晰的 SENSENOVA_* 命名，映射到代码识别的 OPENAI_* 环境变量
           OPENAI_API_KEY: ${{ secrets.SENSENOVA_API_KEY }}
-          OPENAI_BASE_URL: ${{ vars.SENSENOVA_BASE_URL || 'https://token.sensenova.cn/v1' }}
-          OPENAI_MODEL: ${{ vars.SENSENOVA_MODEL || 'openai/sensenova-6.7-flash-lite' }}
+          OPENAI_BASE_URL: ${{ secrets.SENSENOVA_BASE_URL || 'https://token.sensenova.cn/v1' }}
+          OPENAI_MODEL: ${{ secrets.SENSENOVA_MODEL || 'openai/sensenova-6.7-flash-lite' }}
           # 如需切回 Gemini 或其他 provider，直接改上面的映射或恢复下方配置
           # GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           STOCK_LIST: "603893,002241,300002,300562,300760,600900,002594,300175,300454,603223,000100,hk01810"
