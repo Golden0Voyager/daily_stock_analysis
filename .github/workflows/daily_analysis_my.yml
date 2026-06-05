@@ -66,6 +66,12 @@ jobs:
           LOG_LEVEL: INFO
           MAX_WORKERS: 1
           REPORT_TYPE: simple
+          # Token Plan 优化：按请求次数计费，减少不必要的重试和间隔
+          REPORT_INTEGRITY_RETRY: 0    # Phase 1：关闭完整性重试，避免每只股额外 1 次请求
+          GEMINI_REQUEST_DELAY: 0      # Phase 1：取消请求间隔
+          LLM_BATCH_MODE: true         # Phase 2：启用真·批量分析（12只股=2次请求）
+          LLM_BATCH_SIZE: 6            # Phase 2：每批分析股票数
+          LLM_BATCH_FALLBACK: true     # Phase 2：批量失败时自动降级为单只分析
 
         run: |
           MODE="${{ github.event.inputs.mode || 'stocks-only' }}"
