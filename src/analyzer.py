@@ -3408,33 +3408,424 @@ class GeminiAnalyzer:
             report_language=report_language,
         )
     
+    def _format_batch_prompt(
+        self,
+        contexts: List[Dict[str, Any]],
+        news_contexts: Optional[Dict[str, str]],
+        report_language: str,
+    ) -> str:
+        """格式化批量 Prompt：每只股独立 section，输出 JSON 数组。"""
+        report_language = normalize_report_language(report_language)
+        parts: List[str] = []
+        n = len(contexts)
+
+        # 批量分析头部指令
+        if report_language == "en":
+            parts.append(
+                f"You are a professional stock analyst. Please analyze the following {n} stocks **independently**. "
+                f"Return a strict JSON **array** with exactly {n} elements. "
+                "The array order must match the input order. Each element follows the same dashboard schema."
+            )
+        else:
+            parts.append(
+                f"你是一位专业的股票分析师。请对以下 {n} 只股票逐一进行**独立分析**，"
+                f"输出一个严格的 JSON **数组**，数组长度必须为 {n}。"
+                "数组中元素的顺序必须与股票输入顺序一致，每个元素使用相同的决策仪表盘格式。"
+            )
+
+        parts.append("")
+        parts.append("---")
+
+        for idx, context in enumerate(contexts, 1):
+            code = context.get("code", "Unknown")
+            name = context.get("stock_name", "")
+            if not name or name.startswith("股票"):
+                name = STOCK_NAME_MAP.get(code, f"股票{code}")
+
+            news = (news_contexts or {}).get(code)
+            # 复用单只股的 prompt 格式化逻辑（内部包含所有数据板块）
+            single_prompt = self._format_prompt(
+                context, name=name, news_context=news, report_language=report_language
+            )
+
+            # 移除原有标题，替换为带序号的批次标题
+            single_body = single_prompt.replace("# 决策仪表盘分析请求", "").strip()
+
+            if report_language == "en":
+                parts.append(f"\n## Stock {idx}/{n}: {code} {name}\n")
+            else:
+                parts.append(f"\n## 股票 {idx}/{n}：{code} {name}\n")
+            parts.append(single_body)
+            parts.append("\n---\n")
+
+        # 输出格式强制声明
+        if report_language == "en":
+            parts.append("""
+## Output Format
+
+Return **only** a JSON array. Do not wrap it in markdown code blocks. Example:
+
+[
+  {"stock_name": "...", "code": "600519", "sentiment_score": 75, ...},
+  {"stock_name": "...", "code": "002241", "sentiment_score": 62, ...}
+]
+""")
+        else:
+            parts.append("""
+## 输出格式
+
+请**只**返回 JSON 数组，不要包裹在 markdown 代码块中。示例：
+
+[
+  {"stock_name": "...", "code": "600519", "sentiment_score": 75, ...},
+  {"stock_name": "...", "code": "002241", "sentiment_score": 62, ...}
+]
+""")
+
+        return "\n".join(parts)
+
+    def _parse_batch_response(
+        self,
+        response_text: str,
+        contexts: List[Dict[str, Any]],
+    ) -> List[AnalysisResult]:
+        """解析 LLM 返回的 JSON 数组，映射到各只股票。"""
+        report_language = normalize_report_language(
+            getattr(self._get_runtime_config(), "report_language", "zh")
+        )
+        n = len(contexts)
+
+        # 1. 提取 JSON 数组
+        cleaned = response_text
+        if "```json" in cleaned:
+            cleaned = cleaned.replace("```json", "").replace("```", "")
+        elif "```" in cleaned:
+            cleaned = cleaned.replace("```", "")
+
+        # 找最外层方括号
+        arr_start = cleaned.find("[")
+        arr_end = cleaned.rfind("]") + 1
+        if arr_start < 0 or arr_end <= arr_start:
+            raise ValueError("Batch response does not contain a JSON array")
+
+        arr_str = cleaned[arr_start:arr_end]
+        arr_str = self._fix_json_string(arr_str)
+        data_list = json.loads(arr_str)
+
+        if not isinstance(data_list, list):
+            raise ValueError(f"Batch response parsed as {type(data_list).__name__}, expected list")
+
+        if len(data_list) != n:
+            logger.warning(
+                "Batch response array length mismatch: expected %d, got %d",
+                n, len(data_list),
+            )
+
+        # 2. 逐条映射为 AnalysisResult
+        results: List[AnalysisResult] = []
+        for idx, context in enumerate(contexts):
+            code = context.get("code", "Unknown")
+            name = context.get("stock_name", "")
+            if not name or name.startswith("股票"):
+                name = STOCK_NAME_MAP.get(code, f"股票{code}")
+
+            if idx < len(data_list):
+                item = data_list[idx]
+                if isinstance(item, dict):
+                    # 复用单条解析逻辑：把 dict 包装成类文本再传给 _parse_response
+                    # 更简单：直接在这里构造 AnalysisResult
+                    ai_name = item.get("stock_name")
+                    if ai_name and (name.startswith("股票") or name == code):
+                        name = ai_name
+
+                    decision_type = item.get("decision_type", "")
+                    if not decision_type:
+                        op = item.get("operation_advice", "持有")
+                        decision_type = infer_decision_type_from_advice(op, default="hold")
+
+                    result = AnalysisResult(
+                        code=code,
+                        name=name,
+                        sentiment_score=int(item.get("sentiment_score", 50)),
+                        trend_prediction=item.get("trend_prediction", "震荡"),
+                        operation_advice=item.get("operation_advice", "持有"),
+                        decision_type=decision_type,
+                        confidence_level=localize_confidence_level(
+                            item.get("confidence_level", "中"), report_language
+                        ),
+                        report_language=report_language,
+                        dashboard=item.get("dashboard"),
+                        trend_analysis=item.get("trend_analysis", ""),
+                        short_term_outlook=item.get("short_term_outlook", ""),
+                        medium_term_outlook=item.get("medium_term_outlook", ""),
+                        technical_analysis=item.get("technical_analysis", ""),
+                        ma_analysis=item.get("ma_analysis", ""),
+                        volume_analysis=item.get("volume_analysis", ""),
+                        pattern_analysis=item.get("pattern_analysis", ""),
+                        fundamental_analysis=item.get("fundamental_analysis", ""),
+                        sector_position=item.get("sector_position", ""),
+                        company_highlights=item.get("company_highlights", ""),
+                        news_summary=item.get("news_summary", ""),
+                        market_sentiment=item.get("market_sentiment", ""),
+                        hot_topics=item.get("hot_topics", ""),
+                        analysis_summary=item.get("analysis_summary", "分析完成"),
+                        key_points=item.get("key_points", ""),
+                        risk_warning=item.get("risk_warning", ""),
+                        buy_reason=item.get("buy_reason", ""),
+                        search_performed=item.get("search_performed", False),
+                        data_sources=item.get("data_sources", "技术面数据"),
+                        success=True,
+                        raw_response=json.dumps(item, ensure_ascii=False),
+                    )
+                    results.append(result)
+                    continue
+
+            # 缺失或格式异常 → 返回失败占位
+            logger.warning("Batch response missing item %d for %s, using placeholder", idx, code)
+            results.append(
+                AnalysisResult(
+                    code=code,
+                    name=name,
+                    sentiment_score=50,
+                    trend_prediction="震荡",
+                    operation_advice="持有",
+                    decision_type="hold",
+                    confidence_level="低",
+                    analysis_summary="批量分析返回缺失或格式异常",
+                    success=False,
+                    error_message="Missing or malformed batch response item",
+                    report_language=report_language,
+                )
+            )
+
+        return results
+
+    def analyze_batch(
+        self,
+        contexts: List[Dict[str, Any]],
+        news_contexts: Optional[Dict[str, str]] = None,
+        *,
+        batch_size: int = 6,
+        progress_callback: Optional[Callable[[int, str], None]] = None,
+        fallback: bool = True,
+    ) -> List[AnalysisResult]:
+        """真·批量分析：将多只股票合并为单次（或少量）LLM 请求。
+
+        Args:
+            contexts: 每只股票的 analysis context 列表。
+            news_contexts: 股票代码到新闻文本的映射（可选）。
+            batch_size: 每批合并的股票数。
+            progress_callback: 进度回调。
+            fallback: 批量失败时是否降级为单只分析。
+
+        Returns:
+            与 contexts 顺序对应的 AnalysisResult 列表。
+        """
+
+        def _emit(progress: int, message: str) -> None:
+            if progress_callback is None:
+                return
+            try:
+                progress_callback(progress, message)
+            except Exception as exc:
+                logger.debug("[analyzer_batch] progress callback skipped: %s", exc)
+
+        if not contexts:
+            return []
+
+        config = self._get_runtime_config()
+        report_language = normalize_report_language(getattr(config, "report_language", "zh"))
+
+        # 未配置 LLM 时的快速降级
+        if not self.is_available():
+            return [
+                AnalysisResult(
+                    code=ctx.get("code", "Unknown"),
+                    name=ctx.get("stock_name", f"股票{ctx.get('code', 'Unknown')}"),
+                    sentiment_score=50,
+                    trend_prediction="Sideways" if report_language == "en" else "震荡",
+                    operation_advice="Hold" if report_language == "en" else "持有",
+                    confidence_level="Low" if report_language == "en" else "低",
+                    analysis_summary="AI analysis is unavailable because no API key is configured.",
+                    success=False,
+                    error_message="LLM API key is not configured",
+                    report_language=report_language,
+                )
+                for ctx in contexts
+            ]
+
+        all_results: List[AnalysisResult] = []
+        total = len(contexts)
+
+        # 按 batch_size 分块
+        for chunk_idx in range(0, total, batch_size):
+            chunk = contexts[chunk_idx : chunk_idx + batch_size]
+            chunk_codes = [c.get("code", "Unknown") for c in chunk]
+            _emit(
+                int(10 + chunk_idx / total * 80),
+                f"批量分析批次 {chunk_idx // batch_size + 1}/{(total - 1) // batch_size + 1}: {','.join(chunk_codes)}",
+            )
+
+            try:
+                # 1. 构建批量 prompt
+                prompt = self._format_batch_prompt(chunk, news_contexts, report_language)
+                system_prompt = self._get_analysis_system_prompt(report_language)
+
+                # 2. 计算动态 max_tokens（保守估计每只股票 2000 tokens）
+                dynamic_max_tokens = min(8192 * len(chunk), 32000)
+                generation_config = {
+                    "temperature": config.llm_temperature,
+                    "max_output_tokens": dynamic_max_tokens,
+                }
+
+                logger.info(
+                    "[Batch] 批次 %d: %d 只股票, prompt=%d chars, max_tokens=%d",
+                    chunk_idx // batch_size + 1,
+                    len(chunk),
+                    len(prompt),
+                    dynamic_max_tokens,
+                )
+
+                # 3. 调用 LLM（非流式，批量模式不用流式减少复杂度）
+                response_text, model_used, llm_usage = self._call_litellm(
+                    prompt,
+                    generation_config,
+                    system_prompt=system_prompt,
+                    stream=False,
+                    response_validator=self._validate_json_array_response,
+                )
+
+                logger.info(
+                    "[Batch] 批次 %d 响应成功: model=%s, usage=%s",
+                    chunk_idx // batch_size + 1,
+                    model_used,
+                    llm_usage,
+                )
+
+                # 4. 解析批量响应
+                chunk_results = self._parse_batch_response(response_text, chunk)
+
+                # 5. 记录 model_used 和 market_snapshot
+                for result, ctx in zip(chunk_results, chunk):
+                    result.model_used = model_used
+                    result.market_snapshot = self._build_market_snapshot(ctx)
+                    result.search_performed = bool(
+                        (news_contexts or {}).get(ctx.get("code"))
+                    )
+                    persist_llm_usage(
+                        llm_usage, model_used, call_type="analysis", stock_code=result.code
+                    )
+
+                all_results.extend(chunk_results)
+
+            except Exception as exc:
+                logger.warning(
+                    "[Batch] 批次 %d 分析失败: %s",
+                    chunk_idx // batch_size + 1,
+                    exc,
+                )
+                if fallback:
+                    logger.info("[Batch] 降级为单只分析: %s", ",".join(chunk_codes))
+                    for ctx in chunk:
+                        code = ctx.get("code", "Unknown")
+                        try:
+                            result = self.analyze(
+                                ctx,
+                                news_context=(news_contexts or {}).get(code),
+                                progress_callback=progress_callback,
+                            )
+                            all_results.append(result)
+                        except Exception as single_exc:
+                            logger.error("[Batch] 单只分析 %s 也失败: %s", code, single_exc)
+                            all_results.append(
+                                AnalysisResult(
+                                    code=code,
+                                    name=ctx.get("stock_name", f"股票{code}"),
+                                    sentiment_score=50,
+                                    trend_prediction="震荡",
+                                    operation_advice="持有",
+                                    decision_type="hold",
+                                    confidence_level="低",
+                                    analysis_summary=f"批量及单只分析均失败: {single_exc}",
+                                    success=False,
+                                    error_message=str(single_exc),
+                                    report_language=report_language,
+                                )
+                            )
+                else:
+                    # 不降级，整批返回失败占位
+                    for ctx in chunk:
+                        code = ctx.get("code", "Unknown")
+                        all_results.append(
+                            AnalysisResult(
+                                code=code,
+                                name=ctx.get("stock_name", f"股票{code}"),
+                                sentiment_score=50,
+                                trend_prediction="震荡",
+                                operation_advice="持有",
+                                decision_type="hold",
+                                confidence_level="低",
+                                analysis_summary=f"批量分析失败: {exc}",
+                                success=False,
+                                error_message=str(exc),
+                                report_language=report_language,
+                            )
+                        )
+
+        _emit(95, f"批量分析完成: {len(all_results)}/{total} 只股票")
+        return all_results
+
+    def _validate_json_array_response(self, text: str) -> None:
+        """Validate that *text* contains a parseable JSON array.
+
+        Raises:
+            ValueError: if no JSON array is found.
+            json.JSONDecodeError: if the extracted JSON cannot be parsed.
+        """
+        cleaned = text
+        if "```json" in cleaned:
+            cleaned = cleaned.replace("```json", "").replace("```", "")
+        elif "```" in cleaned:
+            cleaned = cleaned.replace("```", "")
+
+        arr_start = cleaned.find("[")
+        arr_end = cleaned.rfind("]") + 1
+        if arr_start < 0 or arr_end <= arr_start:
+            raise ValueError("No JSON array found in LLM response")
+
+        arr_str = cleaned[arr_start:arr_end]
+        arr_str = self._fix_json_string(arr_str)
+        parsed = json.loads(arr_str)
+        if not isinstance(parsed, list):
+            raise ValueError(f"LLM response JSON is {type(parsed).__name__}, expected list")
+
     def batch_analyze(
-        self, 
+        self,
         contexts: List[Dict[str, Any]],
         delay_between: float = 2.0
     ) -> List[AnalysisResult]:
         """
-        批量分析多只股票
-        
-        注意：为避免 API 速率限制，每次分析之间会有延迟
-        
+        批量分析多只股票（顺序循环模式，保留向后兼容）。
+
+        如需真·批量分析（单次请求多只股票），请使用 analyze_batch()。
+
         Args:
             contexts: 上下文数据列表
             delay_between: 每次分析之间的延迟（秒）
-            
+
         Returns:
             AnalysisResult 列表
         """
         results = []
-        
+
         for i, context in enumerate(contexts):
             if i > 0:
                 logger.debug(f"等待 {delay_between} 秒后继续...")
                 time.sleep(delay_between)
-            
+
             result = self.analyze(context)
             results.append(result)
-        
+
         return results
 
 
