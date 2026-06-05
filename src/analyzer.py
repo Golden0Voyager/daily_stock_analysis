@@ -3696,13 +3696,30 @@ Return **only** a JSON array. Do not wrap it in markdown code blocks. Example:
         all_results: List[AnalysisResult] = []
         total = len(contexts)
 
-        # 按 batch_size 分块
-        for chunk_idx in range(0, total, batch_size):
-            chunk = contexts[chunk_idx : chunk_idx + batch_size]
+        # 均衡分块：避免 6+1 这种不均衡分布，尽量让各组数量接近
+        # 例如 7 只 → 4+3，8 只 → 4+4，12 只 → 6+6，13 只 → 5+4+4
+        def _make_balanced_chunks(items: List[Any], max_size: int) -> List[List[Any]]:
+            if len(items) <= max_size:
+                return [items]
+            num_chunks = (len(items) + max_size - 1) // max_size
+            base = len(items) // num_chunks
+            rem = len(items) % num_chunks
+            chunks: List[List[Any]] = []
+            start = 0
+            for i in range(num_chunks):
+                size = base + (1 if i < rem else 0)
+                chunks.append(items[start : start + size])
+                start += size
+            return chunks
+
+        chunks = _make_balanced_chunks(contexts, batch_size)
+        num_batches = len(chunks)
+
+        for batch_idx, chunk in enumerate(chunks):
             chunk_codes = [c.get("code", "Unknown") for c in chunk]
             _emit(
-                int(10 + chunk_idx / total * 80),
-                f"批量分析批次 {chunk_idx // batch_size + 1}/{(total - 1) // batch_size + 1}: {','.join(chunk_codes)}",
+                int(10 + batch_idx / num_batches * 80),
+                f"批量分析批次 {batch_idx + 1}/{num_batches}: {','.join(chunk_codes)}",
             )
 
             try:
