@@ -240,7 +240,201 @@ class StockAnalysisPipeline:
             error_msg = f"获取/保存数据失败: {str(e)}"
             logger.error(f"{stock_name}({code}) {error_msg}")
             return False, error_msg
-    
+
+    def _build_stock_context(
+        self,
+        code: str,
+        report_type: ReportType,
+        query_id: str,
+        current_time: Optional[datetime] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """为批量分析准备单只股票的数据和上下文（不含 LLM 调用）。
+
+        包含：实时行情、筹码分布、基本面、趋势分析、新闻搜索、历史数据、上下文增强。
+        若启用 Agent 模式，返回 None（批量模式不支持 Agent，需回退到单只分析）。
+
+        Returns:
+            Dict with keys: enhanced_context, news_context, chip_data, trend_result,
+            fundamental_context, stock_name, realtime_quote.
+            None if Agent mode or preparation fails.
+        """
+        stock_name = code
+        try:
+            stock_name = self.fetcher_manager.get_stock_name(code, allow_realtime=False)
+
+            realtime_quote = None
+            try:
+                if self.config.enable_realtime_quote:
+                    realtime_quote = self.fetcher_manager.get_realtime_quote(code, log_final_failure=False)
+                    if realtime_quote and realtime_quote.name:
+                        stock_name = realtime_quote.name
+            except Exception as e:
+                logger.warning(f"{stock_name}({code}) 实时行情链路异常: {e}")
+
+            if not stock_name:
+                stock_name = f'股票{code}'
+
+            chip_data = None
+            try:
+                chip_data = self.fetcher_manager.get_chip_distribution(code)
+            except Exception as e:
+                logger.warning(f"{stock_name}({code}) 获取筹码分布失败: {e}")
+
+            use_agent = getattr(self.config, 'agent_mode', False)
+            if not use_agent:
+                configured_skills = getattr(self.config, 'agent_skills', [])
+                if configured_skills and configured_skills != ['all']:
+                    use_agent = True
+
+            if use_agent:
+                logger.info(f"{stock_name}({code}) Agent 模式，跳过批量上下文构建")
+                return None
+
+            fundamental_context = None
+            try:
+                fundamental_context = self.fetcher_manager.get_fundamental_context(
+                    code,
+                    budget_seconds=getattr(
+                        self.config,
+                        'fundamental_stage_timeout_seconds',
+                        60.0,
+                    ),
+                )
+            except Exception as e:
+                logger.warning(f"{stock_name}({code}) 基本面聚合失败: {e}")
+                fundamental_context = self.fetcher_manager.build_failed_fundamental_context(code, str(e))
+
+            fundamental_context = self._attach_belong_boards_to_fundamental_context(
+                code, fundamental_context,
+            )
+
+            try:
+                self.db.save_fundamental_snapshot(
+                    query_id=query_id,
+                    code=code,
+                    payload=fundamental_context,
+                    source_chain=fundamental_context.get("source_chain", []),
+                    coverage=fundamental_context.get("coverage", {}),
+                )
+            except Exception as e:
+                logger.debug(f"{stock_name}({code}) 基本面快照写入失败: {e}")
+
+            trend_result = None
+            try:
+                from src.services.history_loader import get_frozen_target_date
+                _mkt = get_market_for_stock(normalize_stock_code(code))
+                frozen = get_frozen_target_date()
+                end_date = frozen if frozen else get_market_now(_mkt).date()
+                start_date = end_date - timedelta(days=89)
+                historical_bars = self.db.get_data_range(code, start_date, end_date)
+                if historical_bars:
+                    df = pd.DataFrame([bar.to_dict() for bar in historical_bars])
+                    if self.config.enable_realtime_quote and realtime_quote:
+                        df = self._augment_historical_with_realtime(df, realtime_quote, code)
+                    trend_result = self.trend_analyzer.analyze(df, code)
+            except Exception as e:
+                logger.warning(f"{stock_name}({code}) 趋势分析失败: {e}", exc_info=True)
+
+            news_context = None
+            if self.search_service is not None and self.search_service.is_available:
+                try:
+                    intel_results = self.search_service.search_comprehensive_intel(
+                        stock_code=code,
+                        stock_name=stock_name,
+                        max_searches=5,
+                    )
+                    if intel_results:
+                        news_context = self.search_service.format_intel_report(intel_results, stock_name)
+                        try:
+                            query_context = self._build_query_context(query_id=query_id)
+                            for dim_name, response in intel_results.items():
+                                if response and response.success and response.results:
+                                    self.db.save_news_intel(
+                                        code=code,
+                                        name=stock_name,
+                                        dimension=dim_name,
+                                        query=response.query,
+                                        response=response,
+                                        query_context=query_context,
+                                    )
+                        except Exception as e:
+                            logger.warning(f"{stock_name}({code}) 保存新闻情报失败: {e}")
+                except Exception as e:
+                    logger.warning(f"{stock_name}({code}) 情报搜索失败: {e}")
+
+            if self.social_sentiment_service is not None and self.social_sentiment_service.is_available and is_us_stock_code(code):
+                try:
+                    social_context = self.social_sentiment_service.get_social_context(code)
+                    if social_context:
+                        if news_context:
+                            news_context = news_context + "\n\n" + social_context
+                        else:
+                            news_context = social_context
+                except Exception as e:
+                    logger.warning(f"{stock_name}({code}) Social sentiment fetch failed: {e}")
+
+            context = self.db.get_analysis_context(code)
+            if context is None:
+                logger.warning(f"{stock_name}({code}) 无法获取历史行情数据")
+                _mkt_date = get_market_now(
+                    get_market_for_stock(normalize_stock_code(code))
+                ).date()
+                context = {
+                    'code': code,
+                    'stock_name': stock_name,
+                    'date': _mkt_date.isoformat(),
+                    'data_missing': True,
+                    'today': {},
+                    'yesterday': {}
+                }
+
+            enhanced_context = self._enhance_context(
+                context,
+                realtime_quote,
+                chip_data,
+                trend_result,
+                stock_name,
+                fundamental_context,
+            )
+
+            return {
+                'enhanced_context': enhanced_context,
+                'news_context': news_context,
+                'chip_data': chip_data,
+                'trend_result': trend_result,
+                'fundamental_context': fundamental_context,
+                'stock_name': stock_name,
+                'realtime_quote': realtime_quote,
+            }
+
+        except Exception as e:
+            logger.error(f"{stock_name}({code}) 批量数据准备失败: {e}")
+            return None
+
+    @staticmethod
+    def _compute_stock_fingerprint(enhanced_context: Dict[str, Any]) -> str:
+        """生成股票数据指纹，用于判断数据是否变化（Phase 3 缓存）。
+
+        取关键数据字段（收盘价、成交量、均线、量比等）拼接后做 MD5，
+        任一字段变化则指纹变化，触发重新分析。
+        """
+        import hashlib
+        today = enhanced_context.get("today", {})
+        rt = enhanced_context.get("realtime", {})
+        parts = [
+            str(enhanced_context.get("code")),
+            str(today.get("close")),
+            str(today.get("volume")),
+            str(today.get("pct_chg")),
+            str(today.get("ma5")),
+            str(today.get("ma10")),
+            str(today.get("ma20")),
+            str(rt.get("price")),
+            str(rt.get("volume_ratio")),
+            str(rt.get("turnover_rate")),
+        ]
+        return hashlib.md5("|".join(parts).encode("utf-8")).hexdigest()
+
     def analyze_stock(self, code: str, report_type: ReportType, query_id: str) -> Optional[AnalysisResult]:
         """
         分析单只股票（增强版：含量比、换手率、筹码分析、多维度情报）
@@ -1760,7 +1954,23 @@ class StockAnalysisPipeline:
             )
         
         results: List[AnalysisResult] = []
-        
+
+        # === 批量 LLM 分析路径（Token Plan 按请求计费优化）===
+        use_batch_llm = (
+            getattr(self.config, 'llm_batch_mode', False)
+            and not dry_run
+            and not single_stock_notify
+        )
+        if use_batch_llm:
+            logger.info("启用批量 LLM 分析模式（llm_batch_mode=true）")
+            return self._run_batch_llm(
+                stock_codes,
+                report_type,
+                send_notification,
+                merge_notification,
+                resume_reference_time,
+            )
+
         # 使用线程池并发处理
         # 注意：max_workers 设置较低（默认3）以避免触发反爬
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
@@ -1851,6 +2061,243 @@ class StockAnalysisPipeline:
                 self._send_notifications(results, report_type)
         
         return results
+
+    def _run_batch_llm(
+        self,
+        stock_codes: List[str],
+        report_type: ReportType,
+        send_notification: bool,
+        merge_notification: bool,
+        resume_reference_time: datetime,
+    ) -> List[AnalysisResult]:
+        """批量 LLM 分析路径：多只股票合并为单次（或少量）LLM 请求。
+
+        流程：
+        1. 并行获取每只股票的数据和上下文
+        2. 按 batch_size 分块，批量调用 LLM
+        3. 后处理（chip_structure / price_position / decision stabilization）
+        4. 保存分析历史、本地报告、发送通知
+        """
+        start_time = time.time()
+        shared_query_id = uuid.uuid4().hex
+        batch_size = getattr(self.config, 'llm_batch_size', 6)
+        fallback_enabled = getattr(self.config, 'llm_batch_fallback', True)
+
+        logger.info(
+            "[Batch] 启动批量分析: %d 只股票, batch_size=%d, fallback=%s",
+            len(stock_codes), batch_size, fallback_enabled,
+        )
+
+        # Step 1: 并行获取每只股票的数据和上下文
+        self._emit_progress(5, "批量模式：正在并行获取各股数据...")
+        stock_data_map: Dict[str, Dict[str, Any]] = {}
+
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            future_to_code = {
+                executor.submit(
+                    self._build_stock_context,
+                    code,
+                    report_type,
+                    shared_query_id,
+                    resume_reference_time,
+                ): code
+                for code in stock_codes
+            }
+
+            for future in as_completed(future_to_code):
+                code = future_to_code[future]
+                try:
+                    data = future.result()
+                    if data is None:
+                        logger.info(f"[Batch] {code} 返回 None（Agent 模式或失败），将回退到单只分析")
+                    else:
+                        stock_data_map[code] = data
+                except Exception as e:
+                    logger.error(f"[Batch] {code} 数据准备异常: {e}")
+
+        # Step 2: 分离批量股票 vs 回退股票（Agent 模式或准备失败的）
+        batch_codes = [c for c in stock_codes if c in stock_data_map]
+        fallback_codes = [c for c in stock_codes if c not in stock_data_map]
+
+        if fallback_codes:
+            logger.info("[Batch] %d 只股票回退到单只分析: %s", len(fallback_codes), ",".join(fallback_codes))
+
+        # Step 3: 缓存检查（Phase 3：数据未变时跳过 LLM）
+        fingerprint_map: Dict[str, str] = {}
+        cached_results: List[AnalysisResult] = []
+        codes_to_analyze: List[str] = []
+
+        for code in batch_codes:
+            data = stock_data_map[code]
+            fingerprint = self._compute_stock_fingerprint(data["enhanced_context"])
+            fingerprint_map[code] = fingerprint
+
+            cached_json = self.db.get_cached_analysis(code, fingerprint)
+            if cached_json:
+                try:
+                    import dataclasses
+                    cached_dict = json.loads(cached_json)
+                    fields = {f.name for f in dataclasses.fields(AnalysisResult)}
+                    filtered = {k: v for k, v in cached_dict.items() if k in fields}
+                    cached_result = AnalysisResult(**filtered)
+                    cached_results.append(cached_result)
+                    logger.info("[Batch] %s 数据未变，命中缓存", code)
+                except Exception as e:
+                    logger.warning("[Batch] %s 缓存解析失败: %s", code, e)
+                    codes_to_analyze.append(code)
+            else:
+                codes_to_analyze.append(code)
+
+        if cached_results:
+            logger.info(
+                "[Batch] %d/%d 只股票命中缓存，跳过 LLM",
+                len(cached_results),
+                len(batch_codes),
+            )
+
+        # Step 4: 批量 LLM 分析（仅对数据变化的股票）
+        batch_results: List[AnalysisResult] = []
+        if codes_to_analyze:
+            ordered_contexts = [stock_data_map[c]["enhanced_context"] for c in codes_to_analyze]
+            ordered_news = {
+                c: stock_data_map[c]["news_context"] for c in codes_to_analyze
+            }
+
+            self._emit_progress(
+                10,
+                f"批量模式：LLM 分析 {len(codes_to_analyze)} 只股票"
+                f"（分 {(len(codes_to_analyze) - 1) // batch_size + 1} 批）...",
+            )
+
+            try:
+                batch_results = self.analyzer.analyze_batch(
+                    ordered_contexts,
+                    news_contexts=ordered_news,
+                    batch_size=batch_size,
+                    progress_callback=self._emit_progress,
+                    fallback=fallback_enabled,
+                )
+            except Exception as e:
+                logger.error("[Batch] 批量分析异常: %s", e)
+                if fallback_enabled:
+                    logger.info("[Batch] 整批降级为单只分析")
+                    fallback_codes.extend(codes_to_analyze)
+                    codes_to_analyze = []
+                    batch_results = []
+                else:
+                    for code in codes_to_analyze:
+                        batch_results.append(
+                            AnalysisResult(
+                                code=code,
+                                name=stock_data_map[code]["stock_name"],
+                                sentiment_score=50,
+                                trend_prediction="震荡",
+                                operation_advice="持有",
+                                decision_type="hold",
+                                confidence_level="低",
+                                analysis_summary=f"批量分析失败: {e}",
+                                success=False,
+                                error_message=str(e),
+                            )
+                        )
+
+            # 保存新分析结果到缓存
+            for result in batch_results:
+                if result and result.success:
+                    fp = fingerprint_map.get(result.code)
+                    if fp:
+                        try:
+                            import dataclasses
+                            result_dict = dataclasses.asdict(result)
+                            result_json = json.dumps(result_dict, ensure_ascii=False, default=str)
+                            self.db.save_cached_analysis(result.code, fp, result_json)
+                        except Exception as e:
+                            logger.warning("[Batch] %s 缓存保存失败: %s", result.code, e)
+
+        # Step 4: 批量结果后处理（含缓存命中结果）
+        final_results: List[AnalysisResult] = []
+        for result in cached_results + batch_results:
+            if result is None:
+                continue
+            data = stock_data_map.get(result.code)
+            if data is None:
+                final_results.append(result)
+                continue
+
+            result.query_id = shared_query_id
+            # 填充价格信息
+            realtime_data = data["enhanced_context"].get("realtime", {})
+            result.current_price = realtime_data.get("price")
+            result.change_pct = realtime_data.get("change_pct")
+
+            # chip_structure fallback
+            if data["chip_data"]:
+                fill_chip_structure_if_needed(result, data["chip_data"])
+
+            # price_position fallback + decision stabilization
+            fill_price_position_if_needed(result, data["trend_result"], data["realtime_quote"])
+            stabilize_decision_with_structure(result, data["trend_result"], data["fundamental_context"])
+
+            # 保存分析历史
+            if result.success:
+                try:
+                    context_snapshot = self._build_context_snapshot(
+                        enhanced_context=data["enhanced_context"],
+                        news_content=data["news_context"],
+                        realtime_quote=data["realtime_quote"],
+                        chip_data=data["chip_data"],
+                    )
+                    self.db.save_analysis_history(
+                        result=result,
+                        query_id=shared_query_id,
+                        report_type=report_type.value,
+                        news_content=data["news_context"],
+                        context_snapshot=context_snapshot,
+                        save_snapshot=self.save_context_snapshot,
+                    )
+                except Exception as e:
+                    logger.warning(f"[Batch] {result.code} 保存分析历史失败: {e}")
+
+            final_results.append(result)
+
+        # Step 5: 回退股票的单只分析
+        fallback_results: List[AnalysisResult] = []
+        if fallback_codes:
+            self._emit_progress(90, f"批量模式：回退分析 {len(fallback_codes)} 只股票...")
+            for code in fallback_codes:
+                try:
+                    result = self.analyze_stock(code, report_type, query_id=shared_query_id)
+                    if result:
+                        fallback_results.append(result)
+                except Exception as e:
+                    logger.error(f"[Batch] 回退分析 {code} 失败: {e}")
+
+        all_results = final_results + fallback_results
+
+        # Step 6: 按原始股票顺序排列结果
+        code_to_result = {r.code: r for r in all_results if r}
+        ordered_results = [code_to_result.get(c) for c in stock_codes]
+        ordered_results = [r for r in ordered_results if r]
+
+        # Step 7: 统计、保存报告、通知
+        elapsed_time = time.time() - start_time
+        success_count = sum(1 for r in ordered_results if r.success)
+        fail_count = len(stock_codes) - success_count
+        logger.info(
+            "[Batch] ===== 批量分析完成 ===== 成功: %d, 失败: %d, 耗时: %.2f 秒",
+            success_count, fail_count, elapsed_time,
+        )
+
+        if ordered_results:
+            self._save_local_report(ordered_results, report_type)
+
+        if ordered_results and send_notification:
+            if merge_notification:
+                self._send_notifications(ordered_results, report_type, skip_push=True)
+            else:
+                self._send_notifications(ordered_results, report_type)
+
+        return ordered_results
 
     def _send_single_stock_notification(
         self,
