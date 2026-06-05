@@ -2405,7 +2405,22 @@ class StockAnalysisPipeline:
         try:
             logger.info("生成决策仪表盘日报...")
             report = self._generate_aggregate_report(results, report_type)
-            
+
+            # 附加 LLM 调用统计到报告末尾
+            stats = self.analyzer.get_session_stats()
+            if stats["call_count"] > 0:
+                stats_md = (
+                    "\n\n---\n\n"
+                    "**🤖 AI 分析成本**\n\n"
+                    f"- LLM 调用: {stats['call_count']} 次\n"
+                    f"- Prompt: {stats['prompt_tokens']:,} tokens\n"
+                    f"- Completion: {stats['completion_tokens']:,} tokens\n"
+                    f"- Total: {stats['total_tokens']:,} tokens"
+                )
+                if stats["fallback_count"] > 0:
+                    stats_md += f"\n- 模型回退: {stats['fallback_count']} 次"
+                report += stats_md
+
             # 跳过推送（单股推送模式 / 合并模式：报告已由 _save_local_report 保存）
             if skip_push:
                 return
