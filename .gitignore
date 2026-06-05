@@ -87,3 +87,4 @@ static/
 # Skill-generated analysis artifacts
 .understand-anything/
 .codegraph/
+uv.lock
