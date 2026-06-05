@@ -1952,7 +1952,10 @@ class StockAnalysisPipeline:
                 "已启用单股推送模式：分析仍并发执行，通知改为在结果收集侧串行发送（报告类型: %s）",
                 report_type_str,
             )
-        
+
+        # 重置 LLM 会话统计
+        self.analyzer.reset_session_stats()
+
         results: List[AnalysisResult] = []
 
         # === 批量 LLM 分析路径（Token Plan 按请求计费优化）===
@@ -2059,7 +2062,19 @@ class StockAnalysisPipeline:
                 self._send_notifications(results, report_type, skip_push=True)
             else:
                 self._send_notifications(results, report_type)
-        
+
+        # 输出 LLM 调用统计日志
+        stats = self.analyzer.get_session_stats()
+        if stats["call_count"] > 0:
+            logger.info(
+                "[LLM Stats] 本轮调用: %d 次, prompt=%d, completion=%d, total=%d tokens, fallback=%d 次",
+                stats["call_count"],
+                stats["prompt_tokens"],
+                stats["completion_tokens"],
+                stats["total_tokens"],
+                stats["fallback_count"],
+            )
+
         return results
 
     def _run_batch_llm(
@@ -2080,6 +2095,7 @@ class StockAnalysisPipeline:
         """
         start_time = time.time()
         shared_query_id = uuid.uuid4().hex
+        self.analyzer.reset_session_stats()
         batch_size = getattr(self.config, 'llm_batch_size', 6)
         fallback_enabled = getattr(self.config, 'llm_batch_fallback', True)
 
@@ -2296,6 +2312,18 @@ class StockAnalysisPipeline:
                 self._send_notifications(ordered_results, report_type, skip_push=True)
             else:
                 self._send_notifications(ordered_results, report_type)
+
+        # 输出 LLM 调用统计日志
+        stats = self.analyzer.get_session_stats()
+        if stats["call_count"] > 0:
+            logger.info(
+                "[LLM Stats] 本轮调用: %d 次, prompt=%d, completion=%d, total=%d tokens, fallback=%d 次",
+                stats["call_count"],
+                stats["prompt_tokens"],
+                stats["completion_tokens"],
+                stats["total_tokens"],
+                stats["fallback_count"],
+            )
 
         return ordered_results
 
