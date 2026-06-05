@@ -19,6 +19,7 @@ describe('llmProviderTemplates', () => {
       'moonshot',
       'minimax',
       'volcengine',
+      'sensenova',
       'siliconflow',
       'openrouter',
       'gemini',
