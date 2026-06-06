@@ -5,7 +5,25 @@ import { portfolioApi } from '../api/portfolio';
 import type { ParsedApiError } from '../api/error';
 import { getParsedApiError } from '../api/error';
 import { ApiErrorAlert, Card, Badge, ConfirmDialog, EmptyState, InlineAlert } from '../components/common';
-import { toDateInputValue } from '../utils/format';
+import type { FxRefreshFeedback } from '../utils/portfolioFormat';
+import {
+  buildFxRefreshFeedback,
+  formatBrokerLabel,
+  formatCashDirectionLabel,
+  formatCorporateActionLabel,
+  formatMoney,
+  formatPct,
+  formatPositionMoney,
+  formatPositionPrice,
+  formatSideLabel,
+  formatSignedPct,
+  getCsvCommitVariant,
+  getCsvParseVariant,
+  getFxRefreshFeedbackVariant,
+  getPositionPriceLabel,
+  getTodayIso,
+  hasPositionPrice,
+} from '../utils/portfolioFormat';
 import type {
   PortfolioAccountItem,
   PortfolioCashDirection,
@@ -13,7 +31,6 @@ import type {
   PortfolioCorporateActionListItem,
   PortfolioCorporateActionType,
   PortfolioCostMethod,
-  PortfolioFxRefreshResponse,
   PortfolioImportBrokerItem,
   PortfolioImportCommitResponse,
   PortfolioImportParseResponse,
@@ -45,142 +62,16 @@ type PendingDelete =
   | { eventType: 'cash'; id: number; message: string }
   | { eventType: 'corporate'; id: number; message: string };
 
-type FxRefreshFeedback = {
-  tone: 'neutral' | 'success' | 'warning';
-  text: string;
-};
-
 type FxRefreshContext = {
   viewKey: string;
   requestId: number;
 };
-
-type PortfolioAlertVariant = 'info' | 'success' | 'warning' | 'danger';
 
 const PORTFOLIO_INPUT_CLASS =
   'input-surface input-focus-glow h-11 w-full rounded-xl border bg-transparent px-4 text-sm transition-all focus:outline-none disabled:cursor-not-allowed disabled:opacity-60';
 const PORTFOLIO_SELECT_CLASS = `${PORTFOLIO_INPUT_CLASS} appearance-none pr-10`;
 const PORTFOLIO_FILE_PICKER_CLASS =
   'input-surface input-focus-glow flex h-11 w-full cursor-pointer items-center justify-center rounded-xl border bg-transparent px-4 text-sm transition-all focus:outline-none disabled:cursor-not-allowed disabled:opacity-60';
-
-function getTodayIso(): string {
-  return toDateInputValue(new Date());
-}
-
-function formatMoney(value: number | undefined | null, currency = 'CNY'): string {
-  if (value == null || Number.isNaN(value)) return '--';
-  return `${currency} ${Number(value).toLocaleString('zh-CN', {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
-  })}`;
-}
-
-function formatPct(value: number | undefined | null): string {
-  if (value == null || Number.isNaN(value)) return '--';
-  return `${value.toFixed(2)}%`;
-}
-
-function formatSignedPct(value: number | undefined | null): string {
-  if (value == null || Number.isNaN(value)) return '--';
-  const sign = value > 0 ? '+' : '';
-  return `${sign}${value.toFixed(2)}%`;
-}
-
-function hasPositionPrice(row: PortfolioPositionItem): boolean {
-  return row.priceAvailable !== false && row.priceSource !== 'missing';
-}
-
-function formatPositionPrice(row: PortfolioPositionItem): string {
-  if (!hasPositionPrice(row)) return '--';
-  return row.lastPrice.toFixed(4);
-}
-
-function formatPositionMoney(value: number, row: PortfolioPositionItem): string {
-  if (!hasPositionPrice(row)) return '--';
-  return formatMoney(value, row.valuationCurrency);
-}
-
-function getPositionPriceLabel(row: PortfolioPositionItem): string {
-  if (!hasPositionPrice(row)) return '缺价';
-  if (row.priceSource === 'realtime_quote') {
-    return row.priceProvider ? `实时价 · ${row.priceProvider}` : '实时价';
-  }
-  if (row.priceSource === 'history_close') {
-    return row.priceStale && row.priceDate ? `收盘价 · ${row.priceDate}` : '收盘价';
-  }
-  return row.priceSource || '未知来源';
-}
-
-function formatSideLabel(value: PortfolioSide): string {
-  return value === 'buy' ? '买入' : '卖出';
-}
-
-function formatCashDirectionLabel(value: PortfolioCashDirection): string {
-  return value === 'in' ? '流入' : '流出';
-}
-
-function formatCorporateActionLabel(value: PortfolioCorporateActionType): string {
-  return value === 'cash_dividend' ? '现金分红' : '拆并股调整';
-}
-
-function formatBrokerLabel(value: string, displayName?: string): string {
-  if (displayName && displayName.trim()) return `${value}（${displayName.trim()}）`;
-  if (value === 'huatai') return 'huatai（华泰）';
-  if (value === 'citic') return 'citic（中信）';
-  if (value === 'cmb') return 'cmb（招商）';
-  return value;
-}
-
-function buildFxRefreshFeedback(data: PortfolioFxRefreshResponse): FxRefreshFeedback {
-  if (data.refreshEnabled === false) {
-    return {
-      tone: 'neutral',
-      text: '汇率在线刷新已被禁用。',
-    };
-  }
-
-  if (data.pairCount === 0) {
-    return {
-      tone: 'neutral',
-      text: '当前范围无可刷新的汇率对。',
-    };
-  }
-
-  if (data.updatedCount > 0 && data.staleCount === 0 && data.errorCount === 0) {
-    return {
-      tone: 'success',
-      text: `汇率已刷新，共更新 ${data.updatedCount} 对。`,
-    };
-  }
-
-  const summary = `更新 ${data.updatedCount} 对，仍过期 ${data.staleCount} 对，失败 ${data.errorCount} 对。`;
-  if (data.staleCount > 0) {
-    return {
-      tone: 'warning',
-      text: `已尝试刷新，但仍有部分货币对使用 stale/fallback 汇率。${summary}`,
-    };
-  }
-
-  return {
-    tone: 'warning',
-    text: `在线刷新未完全成功。${summary}`,
-  };
-}
-
-function getFxRefreshFeedbackVariant(tone: FxRefreshFeedback['tone']): PortfolioAlertVariant {
-  if (tone === 'success') return 'success';
-  if (tone === 'warning') return 'warning';
-  return 'info';
-}
-
-function getCsvParseVariant(result: PortfolioImportParseResponse): PortfolioAlertVariant {
-  return result.errorCount > 0 || result.skippedCount > 0 ? 'warning' : 'info';
-}
-
-function getCsvCommitVariant(result: PortfolioImportCommitResponse, isDryRun: boolean): PortfolioAlertVariant {
-  if (isDryRun) return 'info';
-  return result.failedCount > 0 || result.duplicateCount > 0 ? 'warning' : 'success';
-}
 
 const PortfolioPage: React.FC = () => {
   // Set page title
@@ -209,6 +100,8 @@ const PortfolioPage: React.FC = () => {
   const [error, setError] = useState<ParsedApiError | null>(null);
   const [riskWarning, setRiskWarning] = useState<string | null>(null);
   const [writeWarning, setWriteWarning] = useState<string | null>(null);
+  const [positionAnalysisLoadingKey, setPositionAnalysisLoadingKey] = useState<string | null>(null);
+  const [positionAnalysisMessage, setPositionAnalysisMessage] = useState<string | null>(null);
 
   const [brokers, setBrokers] = useState<PortfolioImportBrokerItem[]>([]);
   const [selectedBroker, setSelectedBroker] = useState('huatai');
@@ -467,6 +360,25 @@ const PortfolioPage: React.FC = () => {
     rows.sort((a, b) => Number(b.marketValueBase || 0) - Number(a.marketValueBase || 0));
     return rows;
   }, [snapshot]);
+
+  const handleAnalyzePosition = async (row: FlatPosition) => {
+    const key = `${row.accountId}-${row.symbol}-${row.market}`;
+    setPositionAnalysisLoadingKey(key);
+    setPositionAnalysisMessage(null);
+    setError(null);
+    try {
+      const task = await portfolioApi.analyzePosition(row.symbol, {
+        accountId: row.accountId,
+        analysisPhase: 'auto',
+        force: false,
+      });
+      setPositionAnalysisMessage(`已提交 ${row.symbol} 分析任务：${task.taskId}`);
+    } catch (err) {
+      setError(getParsedApiError(err));
+    } finally {
+      setPositionAnalysisLoadingKey(null);
+    }
+  };
 
   const sectorPieData = useMemo(() => {
     const sectors = risk?.sectorConcentration?.topSectors || [];
@@ -868,6 +780,13 @@ const PortfolioPage: React.FC = () => {
           message={writeWarning}
         />
       ) : null}
+      {positionAnalysisMessage ? (
+        <InlineAlert
+          variant="success"
+          title="分析任务"
+          message={positionAnalysisMessage}
+        />
+      ) : null}
 
       {(showCreateAccount || !hasAccounts) ? (
         <Card padding="md">
@@ -1002,11 +921,15 @@ const PortfolioPage: React.FC = () => {
                     <th className="text-right py-2 pr-2">市值</th>
                     <th className="text-right py-2">未实现盈亏</th>
                     <th className="text-right py-2">收益率</th>
+                    <th className="text-right py-2">操作</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {positionRows.map((row) => (
-                    <tr key={`${row.accountId}-${row.symbol}-${row.market}`} className="border-b border-white/5">
+                  {positionRows.map((row) => {
+                    const rowKey = `${row.accountId}-${row.symbol}-${row.market}`;
+                    const analyzing = positionAnalysisLoadingKey === rowKey;
+                    return (
+                    <tr key={rowKey} className="border-b border-white/5">
                       <td className="py-2 pr-2 text-secondary">{row.accountName}</td>
                       <td className="py-2 pr-2 font-mono text-foreground">{row.symbol}</td>
                       <td className="py-2 pr-2 text-right">{row.quantity.toFixed(2)}</td>
@@ -1040,8 +963,19 @@ const PortfolioPage: React.FC = () => {
                       >
                         {formatSignedPct(row.unrealizedPnlPct)}
                       </td>
+                      <td className="py-2 text-right">
+                        <button
+                          type="button"
+                          onClick={() => void handleAnalyzePosition(row)}
+                          disabled={analyzing}
+                          className="btn-secondary px-2 py-1 text-xs disabled:cursor-wait disabled:opacity-60"
+                        >
+                          {analyzing ? '提交中' : '分析'}
+                        </button>
+                      </td>
                     </tr>
-                  ))}
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
