@@ -2453,6 +2453,21 @@ class GeminiAnalyzer:
         if progress_callback and chars_received > 0:
             progress_callback(chars_received)
 
+        # 某些 provider（如 SenseNova）不返回 usage，用 tiktoken 估算
+        if not usage.get("total_tokens"):
+            try:
+                import tiktoken
+                enc = tiktoken.get_encoding("cl100k_base")
+                # 流式模式下没有 prompt 文本，只能估算 completion
+                completion_tokens = len(enc.encode(response_text))
+                usage = {
+                    "prompt_tokens": 0,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": completion_tokens,
+                }
+            except Exception:
+                pass
+
         return response_text, usage
 
     def _call_litellm(
@@ -2615,6 +2630,20 @@ class GeminiAnalyzer:
                 content = self._extract_completion_text(response)
                 if content:
                     usage = self._normalize_usage(self._get_response_field(response, "usage"))
+                    # 某些 provider（如 SenseNova）不返回 usage，用 tiktoken 估算
+                    if not usage.get("total_tokens"):
+                        try:
+                            import tiktoken
+                            enc = tiktoken.get_encoding("cl100k_base")
+                            prompt_tokens = len(enc.encode(prompt))
+                            completion_tokens = len(enc.encode(content))
+                            usage = {
+                                "prompt_tokens": prompt_tokens,
+                                "completion_tokens": completion_tokens,
+                                "total_tokens": prompt_tokens + completion_tokens,
+                            }
+                        except Exception:
+                            pass
                     last_response_text = content
                     last_model = model
                     last_usage = usage
