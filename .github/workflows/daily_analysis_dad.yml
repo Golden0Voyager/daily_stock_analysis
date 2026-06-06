@@ -58,7 +58,7 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.SENSENOVA_API_KEY }}
           OPENAI_BASE_URL: ${{ secrets.SENSENOVA_BASE_URL || 'https://token.sensenova.cn/v1' }}
           OPENAI_MODEL: ${{ secrets.SENSENOVA_MODEL || 'openai/sensenova-6.7-flash-lite' }}
-          STOCK_LIST: "300348,600729,688122,601156,002028,000400"
+          STOCK_LIST: ${{ secrets.STOCK_LIST_DAD }}
           FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
           LOG_LEVEL: INFO
           MAX_WORKERS: 1

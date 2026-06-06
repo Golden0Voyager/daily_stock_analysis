@@ -61,7 +61,7 @@ jobs:
           OPENAI_MODEL: ${{ secrets.SENSENOVA_MODEL || 'openai/sensenova-6.7-flash-lite' }}
           # 如需切回 Gemini 或其他 provider，直接改上面的映射或恢复下方配置
           # GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          STOCK_LIST: "603893,002241,300002,300562,300760,600900,002594,300175,300454,603223,000100,hk01810"
+          STOCK_LIST: ${{ secrets.STOCK_LIST_MY }}
           FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
           LOG_LEVEL: INFO
           MAX_WORKERS: 1
