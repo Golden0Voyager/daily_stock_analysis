@@ -17,16 +17,20 @@ A股自选股智能分析系统 - 通知层
 from __future__ import annotations
 
 import logging
+import time
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple, TYPE_CHECKING
 from enum import Enum
 
 from src.config import Config, get_config
 from src.enums import ReportType
+from src.market_phase_summary import format_public_market_status_line, format_public_phase_pack_excerpt
 from src.notification_routing import (
     get_notification_route_config,
     split_notification_route_channels,
 )
+from src.notification_contracts import is_feishu_static_configured
 from src.notification_noise import (
     NotificationNoiseDecision,
     evaluate_notification_noise,
@@ -37,12 +41,15 @@ from src.report_language import (
     get_localized_stock_name,
     get_report_labels,
     get_signal_level,
+    get_chip_unavailable_reason,
+    is_chip_structure_unavailable,
     localize_chip_health,
     localize_operation_advice,
     localize_trend_prediction,
     normalize_report_language,
 )
 from bot.models import BotMessage
+from src.utils.sanitize import sanitize_diagnostic_text
 from src.utils.data_processing import normalize_model_used
 from src.notification_sender import (
     AstrbotSender,
@@ -65,6 +72,26 @@ from src.notification_sender import (
 
 logger = logging.getLogger(__name__)
 
+
+def _safe_float(value: Any) -> Optional[float]:
+    """Best-effort float conversion; handles `"3.2%"` and `"1,234"` shapes."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+    text = str(value).strip().replace(",", "")
+    if text.endswith("%"):
+        text = text[:-1].strip()
+    if not text:
+        return None
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
 if TYPE_CHECKING:
     from src.analyzer import AnalysisResult
 
@@ -85,6 +112,29 @@ class NotificationChannel(Enum):
     SLACK = "slack"        # Slack
     ASTRBOT = "astrbot"
     UNKNOWN = "unknown"    # 未知
+
+
+@dataclass
+class ChannelAttemptResult:
+    """One static notification channel send attempt."""
+
+    channel: str
+    success: bool
+    error_code: Optional[str] = None
+    retryable: bool = False
+    latency_ms: Optional[int] = None
+    diagnostics: Optional[str] = None
+
+
+@dataclass
+class NotificationDispatchResult:
+    """Structured result for notification dispatch diagnostics."""
+
+    dispatched: bool
+    success: bool
+    status: str
+    channel_results: List[ChannelAttemptResult] = field(default_factory=list)
+    message: Optional[str] = None
 
 
 class ChannelDetector:
@@ -190,8 +240,10 @@ class NotificationService(
 
         # 检测所有已配置的渠道
         self._available_channels = self._detect_all_channels()
-        if self._has_context_channel():
+        if self._extract_dingtalk_session_webhook() is not None:
             self._context_channels.append("钉钉会话")
+        if self._extract_feishu_reply_info() is not None:
+            self._context_channels.append("飞书会话")
 
         if not self._available_channels and not self._context_channels:
             logger.warning("未配置有效的通知渠道，将不发送推送通知")
@@ -286,6 +338,36 @@ class NotificationService(
                 models.append(model)
         return list(dict.fromkeys(models))
 
+    def _public_phase_pack_excerpt(self, result: AnalysisResult, report_language: str) -> str:
+        return format_public_phase_pack_excerpt(
+            getattr(result, "market_phase_summary", None),
+            getattr(result, "analysis_context_pack_overview", None),
+            source=getattr(result, "analysis_visibility_source", None) or "evaluator_snapshot",
+            report_language=report_language,
+        )
+
+    def _public_market_status_line(self, results: List[AnalysisResult], report_language: str) -> str:
+        for result in results or []:
+            line = format_public_market_status_line(
+                getattr(result, "market_phase_summary", None),
+                report_language=report_language,
+            )
+            if line:
+                return line
+        return ""
+
+    def _append_market_status_line(
+        self,
+        lines: List[str],
+        results: List[AnalysisResult],
+        report_language: str,
+    ) -> None:
+        status_line = self._public_market_status_line(results, report_language)
+        if status_line:
+            lines.extend([status_line, ""])
+        elif lines and lines[-1] != "":
+            lines.append("")
+
     def _should_show_llm_model(self) -> bool:
         return bool(getattr(self._config, "report_show_llm_model", self._report_show_llm_model))
     
@@ -303,7 +385,7 @@ class NotificationService(
         if getattr(config, "wechat_webhook_url", None):
             channels.append(NotificationChannel.WECHAT)
 
-        if getattr(config, "feishu_webhook_url", None):
+        if is_feishu_static_configured(config):
             channels.append(NotificationChannel.FEISHU)
 
         if (
@@ -456,7 +538,39 @@ class NotificationService(
         return (
             self._extract_dingtalk_session_webhook() is not None
             or self._extract_feishu_reply_info() is not None
+            or self._extract_telegram_context_chat_id() is not None
         )
+
+    def _source_platform(self) -> str:
+        """Return normalized platform from the source bot message."""
+        platform = getattr(self._source_message, "platform", "")
+        if hasattr(platform, "value"):
+            platform = platform.value
+        return str(platform or "").lower()
+
+    def _extract_telegram_context_chat_id(self) -> Optional[str]:
+        """从来源消息中提取 Telegram 上下文 chat_id（用于异步回复）。"""
+        if not isinstance(self._source_message, BotMessage):
+            return None
+        if self._source_platform() != "telegram":
+            return None
+        raw_data = getattr(self._source_message, "raw_data", {}) or {}
+        for candidate in (
+            getattr(self._source_message, "chat_id", ""),
+            raw_data.get("chat_id"),
+            raw_data.get("message", {}).get("chat", {}).get("id") if isinstance(raw_data.get("message"), dict) else None,
+        ):
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+            if candidate is not None and not isinstance(candidate, str):
+                candidate_text = str(candidate).strip()
+                if candidate_text:
+                    return candidate_text
+        return None
+
+    def should_broadcast_static_channels(self) -> bool:
+        """Whether static notification channels should receive this dispatch."""
+        return not self._has_context_channel()
 
     def _extract_dingtalk_session_webhook(self) -> Optional[str]:
         """从来源消息中提取钉钉会话 Webhook（用于 Stream 模式回复）"""
@@ -531,6 +645,18 @@ class NotificationService(
                     logger.error("飞书会话（Stream）推送失败")
             except Exception as e:
                 logger.error(f"飞书会话（Stream）推送异常: {e}")
+
+        # 尝试 Telegram 会话上下文（按来源 chat_id 回执）
+        telegram_chat_id = self._extract_telegram_context_chat_id()
+        if telegram_chat_id:
+            try:
+                if self.send_to_telegram(content, chat_id=telegram_chat_id):
+                    logger.info("已通过 Telegram 上下文会话推送报告")
+                    success = True
+                else:
+                    logger.error("Telegram 上下文会话推送失败")
+            except Exception as e:
+                logger.error(f"Telegram 上下文会话推送异常: {e}")
 
         return success
 
@@ -675,10 +801,9 @@ class NotificationService(
             "",
             f"> {labels['analyzed_prefix']} **{len(results)}** {labels['stock_unit']} | "
             f"{labels['generated_at_label']}：{datetime.now().strftime('%H:%M:%S')}",
-            "",
-            "---",
-            "",
         ]
+        self._append_market_status_line(report_lines, results, report_language)
+        report_lines.extend(["---", ""])
         
         # 按评分排序（高分在前）
         sorted_results = sorted(
@@ -734,7 +859,6 @@ class NotificationService(
                     f"**Confidence：{confidence_stars}**",
                     "",
                 ])
-
                 self._append_market_snapshot(report_lines, result)
                 
                 # 核心看点
@@ -950,8 +1074,8 @@ class NotificationService(
             "",
             f"> {labels['analyzed_prefix']} **{len(results)}** {labels['stock_unit']} | "
             f"🟢{labels['buy_label']}:{buy_count} 🟡{labels['watch_label']}:{hold_count} 🔴{labels['sell_label']}:{sell_count}",
-            "",
         ]
+        self._append_market_status_line(report_lines, results, report_language)
 
         # === 新增：分析结果摘要 (Issue #112) ===
         if results:
@@ -1099,12 +1223,25 @@ class NotificationService(
                         ])
                     # 筹码结构
                     if chip_data:
-                        chip_health = localize_chip_health(chip_data.get('chip_health', 'N/A'), report_language)
-                        report_lines.extend([
-                            f"**{labels['chip_label']}**: {chip_data.get('profit_ratio', 'N/A')} | {chip_data.get('avg_cost', 'N/A')} | "
-                            f"{chip_data.get('concentration', 'N/A')} {chip_health}",
-                            "",
-                        ])
+                        if is_chip_structure_unavailable(chip_data):
+                            report_lines.extend([
+                                f"**{labels['chip_label']}**: {get_chip_unavailable_reason(chip_data, report_language)}",
+                                "",
+                            ])
+                        else:
+                            chip_health = localize_chip_health(chip_data.get('chip_health', 'N/A'), report_language)
+                            report_lines.extend([
+                                f"**{labels['chip_label']}**: {chip_data.get('profit_ratio', 'N/A')} | {chip_data.get('avg_cost', 'N/A')} | "
+                                f"{chip_data.get('concentration', 'N/A')} {chip_health}",
+                                "",
+                            ])
+                    else:
+                        chip_unavailable_reason = get_chip_unavailable_reason(data_persp, report_language)
+                        if chip_unavailable_reason:
+                            report_lines.extend([
+                                f"**{labels['chip_label']}**: {chip_unavailable_reason}",
+                                "",
+                            ])
                 
                 # ========== 作战计划 ==========
                 battle = dashboard.get('battle_plan', {}) if dashboard else {}
@@ -1146,7 +1283,10 @@ class NotificationService(
                         for item in checklist:
                             report_lines.append(f"- {item}")
                         report_lines.append("")
-                
+
+                # 财务摘要 / 股东回报 / 关联板块（数据缺失时自动隐藏对应小节）
+                self._append_fundamental_blocks(report_lines, result)
+
                 # 如果没有 dashboard，显示传统格式
                 if not dashboard:
                     # 操作理由
@@ -1238,8 +1378,8 @@ class NotificationService(
             "",
             f"> {len(results)} {labels['stock_unit']} | "
             f"🟢{labels['buy_label']}:{buy_count} 🟡{labels['watch_label']}:{hold_count} 🔴{labels['sell_label']}:{sell_count}",
-            "",
         ]
+        self._append_market_status_line(lines, results, report_language)
         
         # Issue #262: summary_only 时仅输出摘要列表
         if self._report_summary_only:
@@ -1390,8 +1530,8 @@ class NotificationService(
             f"> {labels['analyzed_prefix']} **{len(results)}** {labels['stock_unit_compact']} | "
             f"🟢{labels['buy_label']}:{buy_count} 🟡{labels['watch_label']}:{hold_count} 🔴{labels['sell_label']}:{sell_count} | "
             f"{labels['avg_score_label']}:{avg_score:.0f}",
-            "",
         ]
+        self._append_market_status_line(lines, results, report_language)
         
         # 每只股票精简信息（控制长度）
         for result in sorted_results:
@@ -1478,8 +1618,8 @@ class NotificationService(
             f"# {report_date} {labels['brief_title']}",
             "",
             f"> {len(results)} {labels['stock_unit_compact']} | 🟢{buy_count} 🟡{hold_count} 🔴{sell_count}",
-            "",
         ]
+        self._append_market_status_line(lines, results, report_language)
         for r in sorted_results:
             _, emoji, _ = self._get_signal_level(r)
             name = self._get_display_name(r, report_language)
@@ -1528,6 +1668,10 @@ class NotificationService(
             f"> {report_date} | {labels['score_label']}: **{result.sentiment_score}** | {localize_trend_prediction(result.trend_prediction, report_language)}",
             "",
         ]
+
+        excerpt = self._public_phase_pack_excerpt(result, report_language)
+        if excerpt:
+            lines.extend([excerpt, ""])
 
         self._append_market_snapshot(lines, result)
         
@@ -1606,7 +1750,10 @@ class NotificationService(
                 f"- 💼 **{labels['has_position_label']}**: {pos_advice.get('has_position', labels['continue_holding'])}",
                 "",
             ])
-        
+
+        # 财务摘要 / 股东回报 / 关联板块（数据缺失时自动隐藏对应小节）
+        self._append_fundamental_blocks(lines, result)
+
         lines.append("---")
         if self._should_show_llm_model():
             model_used = normalize_model_used(getattr(result, "model_used", None))
@@ -1669,6 +1816,269 @@ class NotificationService(
 
         lines.append("")
 
+    _CURRENCY_SUFFIX = {
+        "USD": "美元",
+        "HKD": "港元",
+        "CNY": "元",
+        "RMB": "元",
+        "CNH": "元",
+    }
+
+    @classmethod
+    def _format_amount_cn(cls, value: Any, currency: Optional[str] = None) -> str:
+        """Format absolute amounts in 亿/万 + currency suffix; returns N/A on non-numeric.
+
+        ``currency`` accepts ``USD``/``HKD``/``CNY``; unknown values fall back to 元.
+        """
+        try:
+            amount = float(value)
+        except (TypeError, ValueError):
+            return "N/A"
+        if amount != amount:  # NaN
+            return "N/A"
+        sign = "-" if amount < 0 else ""
+        abs_amount = abs(amount)
+        suffix = cls._CURRENCY_SUFFIX.get((currency or "").upper(), "元")
+        if abs_amount >= 1e8:
+            return f"{sign}{abs_amount / 1e8:.2f} 亿{suffix}"
+        if abs_amount >= 1e4:
+            return f"{sign}{abs_amount / 1e4:.2f} 万{suffix}"
+        return f"{sign}{abs_amount:.0f} {suffix}"
+
+    @staticmethod
+    def _format_percent(value: Any) -> str:
+        try:
+            return f"{float(value):.2f}%"
+        except (TypeError, ValueError):
+            return "N/A"
+
+    @classmethod
+    def _format_per_share(cls, value: Any, currency: Optional[str] = None) -> str:
+        try:
+            amount = float(value)
+        except (TypeError, ValueError):
+            return "N/A"
+        if amount != amount:  # NaN
+            return "N/A"
+        suffix = cls._CURRENCY_SUFFIX.get((currency or "").upper(), "元")
+        return f"{amount:.4f} {suffix}"
+
+    @staticmethod
+    def _format_text(value: Any) -> str:
+        if value is None:
+            return "N/A"
+        text = str(value).strip()
+        return text if text else "N/A"
+
+    def _get_fundamental_blocks(self, result: AnalysisResult) -> Dict[str, Any]:
+        """Extract financial_report / dividend / belong_boards / sector_rankings.
+
+        Falls back to empty containers when fundamental_context is missing or partial,
+        so callers can rely on dict shape without re-checking types.
+        """
+        ctx = getattr(result, "fundamental_context", None)
+        if not isinstance(ctx, dict):
+            return {
+                "financial_report": {},
+                "growth": {},
+                "dividend": {},
+                "belong_boards": [],
+                "sector_top": [],
+                "sector_bottom": [],
+            }
+
+        earnings_block = ctx.get("earnings") if isinstance(ctx.get("earnings"), dict) else {}
+        earnings_data = earnings_block.get("data") if isinstance(earnings_block.get("data"), dict) else {}
+        financial_report = earnings_data.get("financial_report") if isinstance(earnings_data.get("financial_report"), dict) else {}
+        dividend = earnings_data.get("dividend") if isinstance(earnings_data.get("dividend"), dict) else {}
+
+        growth_block = ctx.get("growth") if isinstance(ctx.get("growth"), dict) else {}
+        growth_data = growth_block.get("data") if isinstance(growth_block.get("data"), dict) else {}
+
+        boards_block = ctx.get("boards") if isinstance(ctx.get("boards"), dict) else {}
+        boards_data = boards_block.get("data") if isinstance(boards_block.get("data"), dict) else {}
+        sector_top = boards_data.get("top") if isinstance(boards_data.get("top"), list) else []
+        sector_bottom = boards_data.get("bottom") if isinstance(boards_data.get("bottom"), list) else []
+
+        belong_boards = ctx.get("belong_boards") if isinstance(ctx.get("belong_boards"), list) else []
+
+        return {
+            "financial_report": financial_report,
+            "growth": growth_data,
+            "dividend": dividend,
+            "belong_boards": belong_boards,
+            "sector_top": sector_top,
+            "sector_bottom": sector_bottom,
+        }
+
+    def _append_fundamental_blocks(self, lines: List[str], result: AnalysisResult) -> None:
+        """Append 财务摘要 / 股东回报 / 关联板块 markdown blocks.
+
+        Each block is only rendered when at least one cell has data; this keeps
+        the email compact when the fundamental pipeline returned partial/failed
+        results (e.g. HK/US markets, ETF, or AkShare outages).
+        """
+        blocks = self._get_fundamental_blocks(result)
+        report_language = self._get_report_language(result)
+        labels = get_report_labels(report_language)
+
+        self._append_financial_summary(lines, blocks, labels)
+        self._append_shareholder_return(lines, blocks, labels)
+        self._append_related_boards(lines, blocks, labels)
+
+    def _append_financial_summary(
+        self,
+        lines: List[str],
+        blocks: Dict[str, Any],
+        labels: Dict[str, str],
+    ) -> None:
+        report = blocks.get("financial_report") or {}
+        growth = blocks.get("growth") or {}
+        currency = report.get("currency") if isinstance(report.get("currency"), str) else None
+        cells = {
+            "report_date": self._format_text(report.get("report_date")),
+            "revenue": self._format_amount_cn(report.get("revenue"), currency),
+            "net_profit": self._format_amount_cn(report.get("net_profit_parent"), currency),
+            "operating_cash_flow": self._format_amount_cn(report.get("operating_cash_flow"), currency),
+            "roe": self._format_percent(report.get("roe") if report.get("roe") is not None else growth.get("roe")),
+            "revenue_yoy": self._format_percent(growth.get("revenue_yoy")),
+            "net_profit_yoy": self._format_percent(growth.get("net_profit_yoy")),
+            "gross_margin": self._format_percent(growth.get("gross_margin")),
+        }
+        if all(v == "N/A" for v in cells.values()):
+            return
+
+        lines.extend([
+            f"### 💼 {labels['financial_summary_heading']}",
+            "",
+            (
+                f"| {labels['report_date_label']} | {labels['revenue_label']} | "
+                f"{labels['net_profit_label']} | {labels['operating_cash_flow_label']} | "
+                f"{labels['roe_label']} | {labels['revenue_yoy_label']} | "
+                f"{labels['net_profit_yoy_label']} | {labels['gross_margin_label']} |"
+            ),
+            # 报告期居中，金额/比例右对齐 — 与现有市场快照风格保持一致
+            "|:------:|-------:|-------:|-------:|------:|------:|------:|------:|",
+            (
+                f"| {cells['report_date']} | {cells['revenue']} | {cells['net_profit']} | "
+                f"{cells['operating_cash_flow']} | {cells['roe']} | {cells['revenue_yoy']} | "
+                f"{cells['net_profit_yoy']} | {cells['gross_margin']} |"
+            ),
+            "",
+        ])
+
+    def _append_shareholder_return(
+        self,
+        lines: List[str],
+        blocks: Dict[str, Any],
+        labels: Dict[str, str],
+    ) -> None:
+        dividend = blocks.get("dividend") or {}
+        report = blocks.get("financial_report") or {}
+        # Dividends are paid in the trading currency (yfinance `info.currency`)
+        # which can differ from the financial-statement currency (e.g. HK ADRs
+        # often report `financialCurrency=CNY` but pay dividends in HKD).
+        dividend_currency = dividend.get("currency") if isinstance(dividend.get("currency"), str) else None
+        if not dividend_currency:
+            dividend_currency = report.get("currency") if isinstance(report.get("currency"), str) else None
+        events = dividend.get("events") if isinstance(dividend.get("events"), list) else []
+        latest_event = events[0] if events else {}
+        if not isinstance(latest_event, dict):
+            latest_event = {}
+
+        ttm_event_count = dividend.get("ttm_event_count")
+        cells = {
+            "ttm_cash": self._format_per_share(dividend.get("ttm_cash_dividend_per_share"), dividend_currency),
+            "ttm_count": str(ttm_event_count) if isinstance(ttm_event_count, int) else "N/A",
+            "ttm_yield": self._format_percent(dividend.get("ttm_dividend_yield_pct")),
+            "latest_ex": self._format_text(latest_event.get("ex_dividend_date") or latest_event.get("event_date")),
+        }
+        if all(v == "N/A" for v in cells.values()):
+            return
+
+        lines.extend([
+            f"### 💵 {labels['shareholder_return_heading']}",
+            "",
+            (
+                f"| {labels['ttm_cash_dividend_label']} | {labels['ttm_event_count_label']} | "
+                f"{labels['ttm_dividend_yield_label']} | {labels['latest_ex_dividend_label']} |"
+            ),
+            "|---------------------:|----------:|--------:|:--------:|",
+            (
+                f"| {cells['ttm_cash']} | {cells['ttm_count']} | "
+                f"{cells['ttm_yield']} | {cells['latest_ex']} |"
+            ),
+            "",
+        ])
+
+    def _append_related_boards(
+        self,
+        lines: List[str],
+        blocks: Dict[str, Any],
+        labels: Dict[str, str],
+    ) -> None:
+        belong_boards = blocks.get("belong_boards") or []
+        if not belong_boards:
+            return
+
+        sector_signals: Dict[str, Tuple[str, Optional[float]]] = {}
+        for item in blocks.get("sector_top") or []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if not name:
+                continue
+            sector_signals[name] = (labels["leading_board_label"], _safe_float(item.get("change_pct")))
+        for item in blocks.get("sector_bottom") or []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if not name or name in sector_signals:
+                continue
+            sector_signals[name] = (labels["lagging_board_label"], _safe_float(item.get("change_pct")))
+
+        # Pre-resolve rows so we know whether sector-signal columns carry any
+        # data — drop them entirely when every cell would be "--" (typical for
+        # HK/US where there's no 板块涨跌榜 feed) so the table stays compact.
+        prepared: List[Tuple[str, str, Optional[str], Optional[float]]] = []
+        for raw in belong_boards[:5]:
+            if not isinstance(raw, dict):
+                continue
+            name = str(raw.get("name") or "").strip()
+            if not name:
+                continue
+            board_type = self._format_text(raw.get("type"))
+            status_text, change_pct = sector_signals.get(name, (None, None))
+            prepared.append((name, board_type, status_text, change_pct))
+
+        if not prepared:
+            return
+
+        has_sector_signal = any(status is not None for _, _, status, _ in prepared)
+
+        lines.append(f"### 🧩 {labels['related_boards_heading']}")
+        lines.append("")
+        if has_sector_signal:
+            lines.append(
+                f"| {labels['board_name_label']} | {labels['board_type_label']} | "
+                f"{labels['board_status_label']} | {labels['board_change_pct_label']} |"
+            )
+            lines.append("|:-----|:----:|:------:|------:|")
+            for name, board_type, status_text, change_pct in prepared:
+                status = status_text if status_text is not None else "--"
+                change = "--" if change_pct is None else f"{change_pct:+.2f}%"
+                lines.append(f"| {name} | {board_type} | {status} | {change} |")
+        else:
+            if all(board_type == "N/A" for _, board_type, _, _ in prepared):
+                lines.append(" / ".join(name for name, _, _, _ in prepared))
+                lines.append("")
+                return
+            lines.append(f"| {labels['board_name_label']} | {labels['board_type_label']} |")
+            lines.append("|:-----|:----:|")
+            for name, board_type, _, _ in prepared:
+                lines.append(f"| {name} | {board_type} |")
+        lines.append("")
+
     def _should_use_image_for_channel(
         self, channel: NotificationChannel, image_bytes: Optional[bytes]
     ) -> bool:
@@ -1689,7 +2099,65 @@ class NotificationService(
             return False
         return True
 
-    def send(
+    @staticmethod
+    def _sanitize_notification_diagnostics(text: Any) -> str:
+        return sanitize_diagnostic_text(text)
+
+    def _send_to_static_channel(
+        self,
+        channel: NotificationChannel,
+        content: str,
+        *,
+        image_bytes: Optional[bytes],
+        email_stock_codes: Optional[List[str]],
+        email_send_to_all: bool,
+    ) -> bool:
+        use_image = self._should_use_image_for_channel(channel, image_bytes)
+        if channel == NotificationChannel.WECHAT:
+            if use_image:
+                return self._send_wechat_image(image_bytes)
+            return self.send_to_wechat(content)
+        if channel == NotificationChannel.FEISHU:
+            return self.send_to_feishu(content)
+        if channel == NotificationChannel.TELEGRAM:
+            if use_image:
+                return self._send_telegram_photo(image_bytes)
+            return self.send_to_telegram(content)
+        if channel == NotificationChannel.EMAIL:
+            receivers = None
+            if email_send_to_all and self._stock_email_groups:
+                receivers = self.get_all_email_receivers()
+            elif email_stock_codes and self._stock_email_groups:
+                receivers = self.get_receivers_for_stocks(email_stock_codes)
+            if use_image:
+                return self._send_email_with_inline_image(image_bytes, receivers=receivers)
+            return self.send_to_email(content, receivers=receivers)
+        if channel == NotificationChannel.PUSHOVER:
+            return self.send_to_pushover(content)
+        if channel == NotificationChannel.NTFY:
+            return self.send_to_ntfy(content)
+        if channel == NotificationChannel.GOTIFY:
+            return self.send_to_gotify(content)
+        if channel == NotificationChannel.PUSHPLUS:
+            return self.send_to_pushplus(content)
+        if channel == NotificationChannel.SERVERCHAN3:
+            return self.send_to_serverchan3(content)
+        if channel == NotificationChannel.CUSTOM:
+            if use_image:
+                return self._send_custom_webhook_image(image_bytes, fallback_content=content)
+            return self.send_to_custom(content)
+        if channel == NotificationChannel.DISCORD:
+            return self.send_to_discord(content)
+        if channel == NotificationChannel.SLACK:
+            if use_image:
+                return self._send_slack_image(image_bytes, fallback_content=content)
+            return self.send_to_slack(content)
+        if channel == NotificationChannel.ASTRBOT:
+            return self.send_to_astrbot(content)
+        logger.warning(f"不支持的通知渠道: {channel}")
+        return False
+
+    def send_with_results(
         self,
         content: str,
         email_stock_codes: Optional[List[str]] = None,
@@ -1698,11 +2166,11 @@ class NotificationService(
         severity: Optional[str] = None,
         dedup_key: Optional[str] = None,
         cooldown_key: Optional[str] = None,
-    ) -> bool:
+    ) -> NotificationDispatchResult:
         """
-        统一发送接口 - 向所有已配置的渠道发送
+        Send a notification and return per-channel diagnostics.
 
-        遍历所有已配置的渠道，逐一发送消息
+        ``send()`` keeps the historical bool API and delegates here.
 
         Fallback rules (Markdown-to-image, Issue #289):
         - When image_bytes is None (conversion failed / imgkit not installed /
@@ -1720,24 +2188,68 @@ class NotificationService(
             cooldown_key: 可选冷却 key；未设置时使用路由/级别默认 key
 
         Returns:
-            是否至少有一个渠道发送成功
+            Structured dispatch diagnostics.
         """
         context_success = self.send_to_context(content)
+        if not self.should_broadcast_static_channels():
+            if context_success:
+                logger.info("已通过上下文会话完成推送，跳过静态通知渠道")
+                return NotificationDispatchResult(
+                    dispatched=True,
+                    success=True,
+                    status="sent",
+                    channel_results=[ChannelAttemptResult(channel="__context__", success=True)],
+                )
+            logger.warning("交互式上下文推送失败，已跳过静态通知渠道")
+            return NotificationDispatchResult(
+                dispatched=True,
+                success=False,
+                status="all_failed",
+                channel_results=[
+                    ChannelAttemptResult(
+                        channel="__context__",
+                        success=False,
+                        error_code="send_failed",
+                        retryable=True,
+                    )
+                ],
+                message="interactive context delivery failed; static channels skipped",
+            )
 
         if not self._available_channels:
             if context_success:
                 logger.info("已通过消息上下文渠道完成推送（无其他通知渠道）")
-                return True
+                return NotificationDispatchResult(
+                    dispatched=True,
+                    success=True,
+                    status="sent",
+                    channel_results=[ChannelAttemptResult(channel="__context__", success=True)],
+                )
             logger.warning("通知服务不可用，跳过推送")
-            return False
+            return NotificationDispatchResult(
+                dispatched=False,
+                success=False,
+                status="no_channel",
+                message="notification service unavailable",
+            )
 
         target_channels = self.get_channels_for_route(route_type)
         if not target_channels:
             if context_success:
                 logger.info("已通过消息上下文渠道完成推送（路由后无其他通知渠道）")
-                return True
+                return NotificationDispatchResult(
+                    dispatched=True,
+                    success=True,
+                    status="sent",
+                    channel_results=[ChannelAttemptResult(channel="__context__", success=True)],
+                )
             logger.warning("通知路由 %s 未命中任何已配置渠道，跳过静态通知渠道", route_type)
-            return False
+            return NotificationDispatchResult(
+                dispatched=False,
+                success=False,
+                status="no_channel",
+                message=f"notification route {route_type} has no configured channel",
+            )
 
         noise_decision = self.evaluate_noise_control(
             content,
@@ -1748,7 +2260,15 @@ class NotificationService(
         )
         if not noise_decision.should_send:
             logger.info(noise_decision.message)
-            return context_success
+            status = "sent" if context_success else "noise_suppressed"
+            results = [ChannelAttemptResult(channel="__context__", success=True)] if context_success else []
+            return NotificationDispatchResult(
+                dispatched=bool(context_success),
+                success=bool(context_success),
+                status=status,
+                channel_results=results,
+                message=noise_decision.message,
+            )
 
         # Markdown to image (Issue #289): convert once if any channel needs it.
         # Per-channel decision via _should_use_image_for_channel (see send() docstring for fallback rules).
@@ -1786,82 +2306,96 @@ class NotificationService(
 
         success_count = 0
         fail_count = 0
+        channel_results: List[ChannelAttemptResult] = []
 
         for channel in target_channels:
             channel_name = ChannelDetector.get_channel_name(channel)
-            use_image = self._should_use_image_for_channel(channel, image_bytes)
+            started_at = time.monotonic()
             try:
-                if channel == NotificationChannel.WECHAT:
-                    if use_image:
-                        result = self._send_wechat_image(image_bytes)
-                    else:
-                        result = self.send_to_wechat(content)
-                elif channel == NotificationChannel.FEISHU:
-                    result = self.send_to_feishu(content)
-                elif channel == NotificationChannel.TELEGRAM:
-                    if use_image:
-                        result = self._send_telegram_photo(image_bytes)
-                    else:
-                        result = self.send_to_telegram(content)
-                elif channel == NotificationChannel.EMAIL:
-                    receivers = None
-                    if email_send_to_all and self._stock_email_groups:
-                        receivers = self.get_all_email_receivers()
-                    elif email_stock_codes and self._stock_email_groups:
-                        receivers = self.get_receivers_for_stocks(email_stock_codes)
-                    if use_image:
-                        result = self._send_email_with_inline_image(
-                            image_bytes, receivers=receivers
-                        )
-                    else:
-                        result = self.send_to_email(content, receivers=receivers)
-                elif channel == NotificationChannel.PUSHOVER:
-                    result = self.send_to_pushover(content)
-                elif channel == NotificationChannel.NTFY:
-                    result = self.send_to_ntfy(content)
-                elif channel == NotificationChannel.GOTIFY:
-                    result = self.send_to_gotify(content)
-                elif channel == NotificationChannel.PUSHPLUS:
-                    result = self.send_to_pushplus(content)
-                elif channel == NotificationChannel.SERVERCHAN3:
-                    result = self.send_to_serverchan3(content)
-                elif channel == NotificationChannel.CUSTOM:
-                    if use_image:
-                        result = self._send_custom_webhook_image(
-                            image_bytes, fallback_content=content
-                        )
-                    else:
-                        result = self.send_to_custom(content)
-                elif channel == NotificationChannel.DISCORD:
-                    result = self.send_to_discord(content)
-                elif channel == NotificationChannel.SLACK:
-                    if use_image:
-                        result = self._send_slack_image(
-                            image_bytes, fallback_content=content
-                        )
-                    else:
-                        result = self.send_to_slack(content)
-                elif channel == NotificationChannel.ASTRBOT:
-                    result = self.send_to_astrbot(content)
-                else:
-                    logger.warning(f"不支持的通知渠道: {channel}")
-                    result = False
+                result = self._send_to_static_channel(
+                    channel,
+                    content,
+                    image_bytes=image_bytes,
+                    email_stock_codes=email_stock_codes,
+                    email_send_to_all=email_send_to_all,
+                )
+                latency_ms = int((time.monotonic() - started_at) * 1000)
 
                 if result:
                     success_count += 1
                 else:
                     fail_count += 1
+                channel_results.append(
+                    ChannelAttemptResult(
+                        channel=channel.value,
+                        success=bool(result),
+                        error_code=None if result else "send_failed",
+                        retryable=not bool(result),
+                        latency_ms=latency_ms,
+                    )
+                )
 
             except Exception as e:
                 logger.error(f"{channel_name} 发送失败: {e}")
                 fail_count += 1
+                channel_results.append(
+                    ChannelAttemptResult(
+                        channel=channel.value,
+                        success=False,
+                        error_code="exception",
+                        retryable=True,
+                        latency_ms=int((time.monotonic() - started_at) * 1000),
+                        diagnostics=self._sanitize_notification_diagnostics(str(e)),
+                    )
+                )
 
         logger.info(f"通知发送完成：成功 {success_count} 个，失败 {fail_count} 个")
         if success_count > 0:
             self.record_noise_control(noise_decision)
         else:
             self.release_noise_control(noise_decision)
-        return success_count > 0 or context_success
+        success = success_count > 0 or context_success
+        if success_count > 0 and fail_count > 0:
+            status = "partial_failed"
+        elif success_count > 0 or context_success:
+            status = "sent"
+        else:
+            status = "all_failed"
+        if context_success:
+            channel_results.insert(0, ChannelAttemptResult(channel="__context__", success=True))
+        return NotificationDispatchResult(
+            dispatched=True,
+            success=success,
+            status=status,
+            channel_results=channel_results,
+        )
+
+    def send(
+        self,
+        content: str,
+        email_stock_codes: Optional[List[str]] = None,
+        email_send_to_all: bool = False,
+        route_type: Optional[str] = None,
+        severity: Optional[str] = None,
+        dedup_key: Optional[str] = None,
+        cooldown_key: Optional[str] = None,
+    ) -> bool:
+        """
+        统一发送接口 - 向所有已配置的渠道发送。
+
+        Returns:
+            是否至少有一个渠道发送成功
+        """
+        result = self.send_with_results(
+            content,
+            email_stock_codes=email_stock_codes,
+            email_send_to_all=email_send_to_all,
+            route_type=route_type,
+            severity=severity,
+            dedup_key=dedup_key,
+            cooldown_key=cooldown_key,
+        )
+        return bool(result.success)
    
     def save_report_to_file(
         self, 

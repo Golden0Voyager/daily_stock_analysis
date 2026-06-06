@@ -23,6 +23,7 @@ A股自选股智能分析系统 - 主调度程序
 """
 from __future__ import annotations
 
+import multiprocessing
 import os
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -58,6 +59,7 @@ from src.logging_config import setup_logging
 
 logger = logging.getLogger(__name__)
 _RUNTIME_ENV_FILE_KEYS = set()
+_PUBLIC_BIND_HOSTS = frozenset({"0.0.0.0", "::", "[::]", "*"})
 
 
 def _get_active_env_path() -> Path:
@@ -65,6 +67,26 @@ def _get_active_env_path() -> Path:
     if env_file:
         return Path(env_file)
     return Path(__file__).resolve().parent / ".env"
+
+
+def _is_public_bind_host(host: str) -> bool:
+    return (host or "").strip().lower() in _PUBLIC_BIND_HOSTS
+
+
+def _warn_if_public_webui_without_auth(host: str) -> None:
+    if not _is_public_bind_host(host):
+        return
+
+    from src.auth import is_auth_enabled
+
+    if is_auth_enabled():
+        return
+    logger.warning(
+        "WEBUI_HOST=%s binds the Web UI to a public interface while "
+        "ADMIN_AUTH_ENABLED=false. Keep this service behind a trusted network "
+        "boundary or enable admin authentication before exposing it.",
+        host,
+    )
 
 
 def _read_active_env_values() -> Optional[Dict[str, str]]:
@@ -447,6 +469,23 @@ def _run_market_review_with_shared_lock(
         release_market_review_lock(lock_token)
 
 
+def _refresh_stock_index_cache_for_analysis(config: Config) -> None:
+    """Best-effort stock-index refresh for CLI/scheduled analysis paths."""
+    try:
+        from src.services.stock_index_remote_service import (
+            refresh_remote_stock_index_cache,
+            settings_from_config,
+        )
+
+        result = refresh_remote_stock_index_cache(settings_from_config(config))
+        if result.refreshed:
+            logger.info("[stock-index] 分析前已刷新股票索引缓存: %s", result.cache_path)
+        elif result.error:
+            logger.debug("[stock-index] 分析前刷新未完成，继续使用本地索引: %s", result.error)
+    except Exception as exc:  # noqa: BLE001 - stock index freshness must not block analysis.
+        logger.warning("[stock-index] 分析前刷新股票索引失败，继续执行分析: %s", exc)
+
+
 def run_full_analysis(
     config: Config,
     args: argparse.Namespace,
@@ -463,6 +502,8 @@ def run_full_analysis(
     from src.core.pipeline import StockAnalysisPipeline
 
     try:
+        _refresh_stock_index_cache_for_analysis(config)
+
         # Issue #529: Hot-reload STOCK_LIST from .env on each scheduled run
         if stock_codes is None:
             config.refresh_stock_list()
@@ -833,6 +874,7 @@ def main() -> int:
             args.host = os.getenv('WEBUI_HOST')
         if args.port == 8000 and os.getenv('WEBUI_PORT'):
             args.port = int(os.getenv('WEBUI_PORT'))
+        _warn_if_public_webui_without_auth(args.host)
 
     bot_clients_started = False
     if start_serve:
@@ -937,25 +979,23 @@ def main() -> int:
 
             background_tasks = []
             if getattr(config, 'agent_event_monitor_enabled', False):
-                from src.agent.events import build_event_monitor_from_config, run_event_monitor_once
+                from src.services.alert_worker import AlertWorker
 
-                monitor = build_event_monitor_from_config(config)
-                if monitor is not None:
-                    interval_minutes = max(1, getattr(config, 'agent_event_monitor_interval_minutes', 5))
+                interval_minutes = max(1, getattr(config, 'agent_event_monitor_interval_minutes', 5))
+                alert_worker = AlertWorker(config_provider=_reload_runtime_config)
 
-                    def event_monitor_task():
-                        triggered = run_event_monitor_once(monitor)
-                        if triggered:
-                            logger.info("[EventMonitor] 本轮触发 %d 条提醒", len(triggered))
+                def event_monitor_task():
+                    stats = alert_worker.run_once()
+                    triggered_count = stats.get("triggered", 0)
+                    if triggered_count:
+                        logger.info("[EventMonitor] 本轮触发 %d 条提醒", triggered_count)
 
-                    background_tasks.append({
-                        "task": event_monitor_task,
-                        "interval_seconds": interval_minutes * 60,
-                        "run_immediately": True,
-                        "name": "agent_event_monitor",
-                    })
-                else:
-                    logger.info("EventMonitor 已启用，但未加载到有效规则，跳过后台提醒任务")
+                background_tasks.append({
+                    "task": event_monitor_task,
+                    "interval_seconds": interval_minutes * 60,
+                    "run_immediately": True,
+                    "name": "agent_event_monitor",
+                })
 
             run_with_schedule(
                 task=scheduled_task,
@@ -996,4 +1036,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     sys.exit(main())
