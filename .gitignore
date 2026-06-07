@@ -80,6 +80,9 @@ verify_*.py
 !.claude/skills/
 !.claude/skills/**
 
+# Local agent skill cache (source of truth is .claude/skills/)
+.agents/
+
 # ignore static files
 static/
 /apps/dsa-desktop/dist/
