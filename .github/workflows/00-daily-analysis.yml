@@ -74,7 +74,14 @@ jobs:
           LLM_TEMPERATURE: ${{ vars.LLM_TEMPERATURE || secrets.LLM_TEMPERATURE }}
           LLM_CHANNELS: ${{ vars.LLM_CHANNELS || secrets.LLM_CHANNELS }}
 
-          # Gemini AI（主选）
+          # SenseNova Token Plan（取代 Gemini，优先选用）
+          SENSENOVA_API_KEY: ${{ secrets.SENSENOVA_API_KEY }}
+          SENSENOVA_API_KEYS: ${{ secrets.SENSENOVA_API_KEYS }}
+          SENSENOVA_BASE_URL: ${{ vars.SENSENOVA_BASE_URL || secrets.SENSENOVA_BASE_URL || 'https://token.sensenova.cn/v1' }}
+          SENSENOVA_MODEL: ${{ vars.SENSENOVA_MODEL || secrets.SENSENOVA_MODEL || 'sensenova-6.7-flash-lite' }}
+          SENSENOVA_MODEL_FALLBACK: ${{ vars.SENSENOVA_MODEL_FALLBACK || secrets.SENSENOVA_MODEL_FALLBACK || 'deepseek-v4-flash' }}
+
+          # Gemini AI（已弃用，留空即可）
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL || secrets.GEMINI_MODEL || 'gemini-3-flash-preview' }}
