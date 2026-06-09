@@ -35,6 +35,12 @@ class TestPipelinePrefetchBehavior(unittest.TestCase):
             report_type="simple",
             analysis_delay=0,
         )
+        pipeline.analyzer = MagicMock()
+        pipeline.analyzer.get_session_stats.return_value = {
+            "call_count": 0, "prompt_tokens": 0, "completion_tokens": 0,
+            "total_tokens": 0, "fallback_count": 0,
+        }
+        pipeline.analyzer.reset_session_stats.return_value = None
         return pipeline
 
     def test_run_dry_run_skips_stock_name_prefetch(self):

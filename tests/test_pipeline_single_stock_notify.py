@@ -97,6 +97,12 @@ class TestPipelineSingleStockNotify(unittest.TestCase):
             report_type="simple",
             analysis_delay=0,
         )
+        pipeline.analyzer = MagicMock()
+        pipeline.analyzer.get_session_stats.return_value = {
+            "call_count": 0, "prompt_tokens": 0, "completion_tokens": 0,
+            "total_tokens": 0, "fallback_count": 0,
+        }
+        pipeline.analyzer.reset_session_stats.return_value = None
         return pipeline
 
     def test_run_single_stock_notify_serializes_notifications_on_main_thread(self):
@@ -186,6 +192,11 @@ class TestPipelineSingleStockNotify(unittest.TestCase):
         pipeline.config = SimpleNamespace(stock_email_groups=[])
         pipeline.notifier = MagicMock()
         pipeline.notifier.generate_aggregate_report.return_value = "report"
+        pipeline.analyzer = MagicMock()
+        pipeline.analyzer.get_session_stats.return_value = {
+            "call_count": 0, "prompt_tokens": 0, "completion_tokens": 0,
+            "total_tokens": 0, "fallback_count": 0,
+        }
         results = [_make_result("000001"), _make_result("600519")]
         for index, result in enumerate(results):
             result.query_id = f"query-{index}"

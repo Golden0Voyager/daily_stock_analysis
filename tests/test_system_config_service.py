@@ -17,6 +17,7 @@ ensure_litellm_stub()
 
 from src.config import ANSPIRE_LLM_MODEL_DEFAULT, Config
 from src.core.config_manager import ConfigManager
+from src.core.config_registry import get_registered_field_keys
 from src.services.system_config_service import ConfigConflictError, ConfigImportError, SystemConfigService
 
 
@@ -36,6 +37,15 @@ class SystemConfigServiceTestCase(unittest.TestCase):
             + "\n",
             encoding="utf-8",
         )
+        # Remove registered config keys from the process environment to prevent
+        # shell env var leaks (e.g. OPENAI_API_KEY) from polluting validation,
+        # which reads runtime env vars via _build_runtime_display_config_map.
+        self._restore_env: Dict[str, str] = {}
+        registered_field_keys = {key.upper() for key in get_registered_field_keys()}
+        for key in list(os.environ.keys()):
+            key_upper = key.upper()
+            if key_upper in registered_field_keys or key_upper.startswith("LLM_"):
+                self._restore_env[key] = os.environ.pop(key)
         os.environ["ENV_FILE"] = str(self.env_path)
         Config.reset_instance()
 
@@ -45,6 +55,9 @@ class SystemConfigServiceTestCase(unittest.TestCase):
     def tearDown(self) -> None:
         Config.reset_instance()
         os.environ.pop("ENV_FILE", None)
+        for key, value in self._restore_env.items():
+            os.environ[key] = value
+        self._restore_env.clear()
         self.temp_dir.cleanup()
 
     def _rewrite_env(self, *lines: str) -> None:

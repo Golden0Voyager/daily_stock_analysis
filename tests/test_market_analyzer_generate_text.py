@@ -82,6 +82,15 @@ class TestAnalyzerGenerateText:
             from src.analyzer import GeminiAnalyzer
             analyzer = GeminiAnalyzer.__new__(GeminiAnalyzer)
             analyzer._router = None
+            # Initialize session stats (normally done in __init__)
+            analyzer._session_stats = {
+                "call_count": 0,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "fallback_count": 0,
+            }
+            analyzer._legacy_router_model_list = []
             return analyzer
 
     def test_generate_text_returns_llm_response(self):
@@ -360,7 +369,7 @@ class TestAnalyzerGenerateText:
                     message=SimpleNamespace(content="message response"),
                 )
             ],
-            usage=None,
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=2, total_tokens=3),
         )
 
         with patch.object(analyzer, "_dispatch_litellm_completion", return_value=response):
@@ -371,7 +380,7 @@ class TestAnalyzerGenerateText:
 
         assert text == "message response"
         assert model_used == "openai/deepseek-chat"
-        assert usage == {}
+        assert usage == {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
 
     def test_call_litellm_normalizes_kimi_k26_temperature(self):
         analyzer = self._make_analyzer()

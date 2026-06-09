@@ -211,6 +211,8 @@ def test_status_command_supports_legacy_key_compatibility_without_explicit_litel
         "ANTHROPIC_API_KEY",
         "DEEPSEEK_API_KEYS",
         "DEEPSEEK_API_KEY",
+        "SENSENOVA_API_KEYS",
+        "SENSENOVA_API_KEY",
         "OPENAI_API_KEYS",
         "AIHUBMIX_KEY",
         "LITELLM_MODEL",

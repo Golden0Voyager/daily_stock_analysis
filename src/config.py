@@ -666,6 +666,7 @@ class Config:
     anthropic_api_keys: List[str] = field(default_factory=list)
     openai_api_keys: List[str] = field(default_factory=list)
     deepseek_api_keys: List[str] = field(default_factory=list)
+    sensenova_api_keys: List[str] = field(default_factory=list)  # SenseNova Token Plan API Keys
 
     # --- 批量分析配置（Token Plan 等按请求计费场景优化） ---
     llm_batch_mode: bool = False        # 启用真·批量分析：一次请求分析多只股票
@@ -695,6 +696,13 @@ class Config:
     openai_model: str = "gpt-5.5"  # OpenAI 兼容模型名称
     openai_vision_model: Optional[str] = None  # Deprecated: use VISION_MODEL instead
     openai_temperature: float = 0.7  # OpenAI 温度参数（0.0-2.0，默认0.7）
+
+    # SenseNova Token Plan API（商汤大装置，免费公测）
+    sensenova_api_key: Optional[str] = None  # 单 Key 兼容
+    sensenova_base_url: str = "https://token.sensenova.cn/v1"  # OpenAI 兼容端点
+    sensenova_model: str = "sensenova-6.7-flash-lite"  # 模型：sensenova-6.7-flash-lite(1500/5h) 或 deepseek-v4-flash(150/5h)
+    sensenova_model_fallback: str = "deepseek-v4-flash"  # 备选模型
+    sensenova_temperature: float = 0.7
 
     # === Vision 配置 ===
     # VISION_MODEL: litellm model string used for image understanding calls.
@@ -1175,6 +1183,15 @@ class Config:
             if _single_deepseek:
                 deepseek_api_keys = [_single_deepseek]
 
+        # SENSENOVA_API_KEYS > SENSENOVA_API_KEY (SenseNova Token Plan)
+        _sensenova_keys_raw = os.getenv('SENSENOVA_API_KEYS', '')
+        sensenova_api_keys = [k.strip() for k in _sensenova_keys_raw.split(',') if k.strip()]
+        if not sensenova_api_keys:
+            _single_sensenova = os.getenv('SENSENOVA_API_KEY', '').strip()
+            if _single_sensenova:
+                sensenova_api_keys = [_single_sensenova]
+        sensenova_base_url = os.getenv('SENSENOVA_BASE_URL', 'https://token.sensenova.cn/v1').strip()
+
         # Anspire Open shares the same key as Anspire Search and exposes an
         # OpenAI-compatible LLM gateway.  When no other OpenAI-compatible key is
         # configured, use ANSPIRE_API_KEYS as the legacy openai-compatible
@@ -1217,8 +1234,12 @@ class Config:
         if not litellm_model:
             _gemini_model_name = os.getenv('GEMINI_MODEL', 'gemini-3.1-pro-preview').strip()
             _anthropic_model_name = os.getenv('ANTHROPIC_MODEL', 'claude-sonnet-4-6').strip()
+            _sensenova_model_name = os.getenv('SENSENOVA_MODEL', 'sensenova-6.7-flash-lite').strip()
             if gemini_api_keys:
                 litellm_model = f'gemini/{_gemini_model_name}'
+            elif sensenova_api_keys:
+                # SenseNova Token Plan: OpenAI-compatible API, use 'openai' provider with custom base_url
+                litellm_model = f'openai/{_sensenova_model_name}'
             elif anthropic_api_keys:
                 litellm_model = f'anthropic/{_anthropic_model_name}'
             elif deepseek_api_keys:
@@ -1241,6 +1262,14 @@ class Config:
             if litellm_model.startswith('gemini/') and _gemini_fallback:
                 _fb = f'gemini/{_gemini_fallback}' if '/' not in _gemini_fallback else _gemini_fallback
                 litellm_fallback_models = [_fb]
+            elif litellm_model.startswith('openai/') and sensenova_api_keys:
+                # SenseNova fallback: use deepseek-v4-flash as alternative
+                _sensenova_fallback = os.getenv('SENSENOVA_MODEL_FALLBACK', 'deepseek-v4-flash').strip()
+                if _sensenova_fallback:
+                    _fb = f'openai/{_sensenova_fallback}' if '/' not in _sensenova_fallback else _sensenova_fallback
+                    litellm_fallback_models = [_fb]
+                else:
+                    litellm_fallback_models = []
             else:
                 litellm_fallback_models = []
 
@@ -1277,6 +1306,8 @@ class Config:
                 gemini_api_keys, anthropic_api_keys, openai_api_keys,
                 openai_base_url,
                 deepseek_api_keys,
+                sensenova_api_keys,
+                sensenova_base_url,
             )
             if llm_model_list:
                 llm_models_source = "legacy_env"
@@ -2012,6 +2043,8 @@ class Config:
         openai_keys: List[str],
         openai_base_url: Optional[str],
         deepseek_keys: Optional[List[str]] = None,
+        sensenova_keys: Optional[List[str]] = None,
+        sensenova_base_url: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Build Router model_list from legacy per-provider keys (backward compat).
 
@@ -2033,6 +2066,17 @@ class Config:
                 model_list.append({
                     'model_name': '__legacy_gemini__',
                     'litellm_params': {'model': '__legacy_gemini__', 'api_key': k},
+                })
+
+        # SenseNova Token Plan keys (OpenAI-compatible with custom base_url)
+        for k in (sensenova_keys or []):
+            if k and len(k) >= 8:
+                params: Dict[str, Any] = {'model': '__legacy_sensenova__', 'api_key': k}
+                if sensenova_base_url:
+                    params['api_base'] = sensenova_base_url
+                model_list.append({
+                    'model_name': '__legacy_sensenova__',
+                    'litellm_params': params,
                 })
 
         # Anthropic keys
