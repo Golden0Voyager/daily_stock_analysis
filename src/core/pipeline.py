@@ -2560,12 +2560,8 @@ class StockAnalysisPipeline:
 
         results: List[AnalysisResult] = []
 
-        # === 批量 LLM 分析路径（Token Plan 按请求计费优化）===
-        use_batch_llm = (
-            getattr(self.config, 'llm_batch_mode', False)
-            and not dry_run
-            and not single_stock_notify
-        )
+        # === 批量 LLM 分析路径（已废弃，全部走单只逐次分析）===
+        use_batch_llm = False
         if use_batch_llm:
             logger.info("启用批量 LLM 分析模式（llm_batch_mode=true）")
             return self._run_batch_llm(

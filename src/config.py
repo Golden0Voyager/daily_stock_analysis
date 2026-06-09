@@ -668,10 +668,8 @@ class Config:
     deepseek_api_keys: List[str] = field(default_factory=list)
     sensenova_api_keys: List[str] = field(default_factory=list)  # SenseNova Token Plan API Keys
 
-    # --- 批量分析配置（Token Plan 等按请求计费场景优化） ---
-    llm_batch_mode: bool = False        # 启用真·批量分析：一次请求分析多只股票
-    llm_batch_size: int = 6             # 每批股票数（12只股=2次请求）
-    llm_batch_fallback: bool = True     # 批量失败时降级为单只分析
+    # --- 批量分析配置（已废弃，强制关闭） ---
+    llm_batch_mode: bool = False
 
     # Legacy single-key fields (kept for backward compatibility; gemini_api_keys[0] when set)
     gemini_api_key: Optional[str] = None
@@ -1492,8 +1490,6 @@ class Config:
             openai_api_keys=openai_api_keys,
             deepseek_api_keys=deepseek_api_keys,
             llm_batch_mode=os.getenv('LLM_BATCH_MODE', 'false').lower() == 'true',
-            llm_batch_size=parse_env_int(os.getenv('LLM_BATCH_SIZE'), 6, field_name='LLM_BATCH_SIZE', minimum=1, maximum=50),
-            llm_batch_fallback=os.getenv('LLM_BATCH_FALLBACK', 'true').lower() == 'true',
             gemini_api_key=os.getenv('GEMINI_API_KEY'),
             gemini_model=os.getenv('GEMINI_MODEL', 'gemini-3.1-pro-preview'),
             gemini_model_fallback=os.getenv('GEMINI_MODEL_FALLBACK', 'gemini-3-flash-preview'),
