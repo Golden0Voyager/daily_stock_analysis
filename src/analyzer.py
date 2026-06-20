@@ -4078,7 +4078,7 @@ Return **only** a JSON array. Do not wrap it in markdown code blocks. Example:
 
                 logger.info(
                     "[Batch] 批次 %d: %d 只股票, prompt=%d chars, max_tokens=%d",
-                    chunk_idx // batch_size + 1,
+                    batch_idx + 1,
                     len(chunk),
                     len(prompt),
                     dynamic_max_tokens,
@@ -4096,7 +4096,7 @@ Return **only** a JSON array. Do not wrap it in markdown code blocks. Example:
 
                 logger.info(
                     "[Batch] 批次 %d 响应成功: model=%s, usage=%s",
-                    chunk_idx // batch_size + 1,
+                    batch_idx + 1,
                     model_used,
                     llm_usage,
                 )
@@ -4120,7 +4120,7 @@ Return **only** a JSON array. Do not wrap it in markdown code blocks. Example:
             except Exception as exc:
                 logger.warning(
                     "[Batch] 批次 %d 分析失败: %s",
-                    chunk_idx // batch_size + 1,
+                    batch_idx + 1,
                     exc,
                 )
                 if fallback:

@@ -11,6 +11,7 @@ A股自选股智能分析系统 - 核心分析流水线
 4. 提供股票分析的核心功能
 """
 
+import json
 import logging
 import threading
 import time
@@ -30,6 +31,7 @@ from data_provider.realtime_types import ChipDistribution
 from src.analyzer import (
     GeminiAnalyzer,
     AnalysisResult,
+    fill_chip_structure_if_needed,
     fill_price_position_if_needed,
     normalize_chip_structure_availability,
     stabilize_decision_with_structure,

@@ -76,6 +76,9 @@ jobs:
       - name: ✅ Offline test suite
         run: ./scripts/ci_gate.sh offline-tests
 
+      - name: ✅ Enforce coverage threshold
+        run: coverage report
+
   docker-build:
     name: docker-build
     runs-on: ubuntu-latest
