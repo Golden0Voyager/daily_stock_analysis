@@ -64,8 +64,10 @@ reports/
 .DS_Store
 Thumbs.db
 
-# 测试
+# 测试与缓存
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .coverage
 htmlcov/
 
